@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Secrets and Private Configuration Files (CRITICAL: NEVER COMMIT)
+config.json
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.pfx
+
+# Generated Loan Documents (Keep directory structure via .gitkeep)
+sanctions/*.pdf
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Installer and runtime logs
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test and coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# Distribution and packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Temporary files and scratch scripts
+tmp/
+scratch/
+
+# Original Git History Backup
+.git_original_backup/
+

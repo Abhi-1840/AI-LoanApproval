@@ -1,0 +1,28 @@
+# AI Loan Approval System - Dependencies
+# Compatible with Python 3.10 - 3.13
+
+# Web Framework
+Flask==3.1.0
+flask-cors==5.0.0
+
+# HTTP Requests (Firebase communication)
+requests==2.32.3
+
+# PDF & Document Generation
+reportlab==4.2.5
+fpdf2==2.8.2
+xhtml2pdf==0.2.16
+pypdf==7.1.1
+python-docx==1.2.0
+
+# Google Gemini AI + LangChain
+google-generativeai==0.8.3
+langchain==0.3.14
+langchain-google-genai==2.0.7
+langchain-core==0.3.29
+
+# WSGI Server (for production deployment)
+gunicorn==23.0.0
+
+# Environment Variables Helper
+python-dotenv==1.0.1

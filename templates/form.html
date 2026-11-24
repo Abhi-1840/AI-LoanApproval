@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>LoanAI • Customer Onboarding & Admin Console</title>
+    <!-- Prevent theme flash -->
+    <script>
+        (function () {
+            const savedTheme = localStorage.getItem('loan_ai_theme') ||
+                (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+            document.documentElement.setAttribute('data-theme', savedTheme);
+        })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/form.css') }}">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <div class="header">
+            <div class="header-badge">
+                <img src="/static/img/loanai-logo.png" alt="LoanAI" width="16" height="16" style="vertical-align:middle;object-fit:contain;margin-right:4px;">
+                <span>✦ Intelligent Lending Platform</span>
+            </div>
+            <h1>ADMIN PANEL</h1>
+            <p>Fill customer details to save into the database.</p>
+        </div>
+
+        <div class="card">
+
+            <div class="cardHeader">
+                <h2>Add Customer</h2>
+                <p>Customer will be saved in Firebase Realtime Database</p>
+            </div>
+
+            <div class="cardContent">
+                <form action="/add-customer" method="POST" id="loanForm">
+
+                    <div class="formGroup">
+                        <label for="customerName">Customer Name</label>
+                        <input id="customerName" name="customerName" type="text" required />
+                    </div>
+
+                    <div class="formGroup">
+                        <label for="phoneNumber">Phone Number (Customer ID)</label>
+                        <input id="phoneNumber" name="phoneNumber" type="tel" required />
+                    </div>
+
+                    <div class="formRow">
+                        <div class="formGroup">
+                            <label for="dob">Date of Birth</label>
+                            <input id="dob" name="dob" type="date" />
+                        </div>
+
+                        <div class="formGroup">
+                            <label for="age">Age (21 - 65 yrs)</label>
+                            <input id="age" name="age" type="number" min="21" max="65" required />
+                        </div>
+                    </div>
+
+                    <div class="formGroup">
+                        <label for="city">City</label>
+                        <input id="city" name="city" type="text" required />
+                    </div>
+
+                    <div class="formGroup">
+                        <label for="panNumber">PAN Number</label>
+                        <input id="panNumber" name="panNumber" type="text" style="text-transform: uppercase;"
+                            pattern="[A-Z]{5}[0-9]{4}[A-Z]{1}" required />
+                    </div>
+                    
+                    <div class="formGroup">
+                        <label for="emailAddress">Email ID</label>
+                        <input id="emailAddress" name="emailAddress" type="email" />
+                    </div>
+
+                    <div class="formRow">
+                        <div class="formGroup">
+                            <label for="salary">Monthly Net Salary (₹)</label>
+                            <input id="salary" name="salary" type="number" min="1" required />
+                        </div>
+
+                        <div class="formGroup">
+                            <label for="currentLoan">Existing Monthly EMIs (₹)</label>
+                            <input id="currentLoan" name="currentLoan" type="number" min="0" value="0" required />
+                        </div>
+                    </div>
+
+                    <div class="formGroup">
+                        <label for="creditScore">CIBIL / Credit Score (Min 700)</label>
+                        <input id="creditScore" name="creditScore" type="number" min="700" max="900" required />
+                    </div>
+
+                    <button type="submit" class="submitBtn">Submit & Verify Eligibility</button>
+
+                </form>
+
+                {% if success %}
+                <div id="successMessage" class="successMessage show">
+                    <h2>✅ Customer Added Successfully!</h2>
+                    <p>Customer ID: <strong>{{ customer_id }}</strong></p>
+                    <p>Use this ID in the chatbot at <a href="http://localhost:5000" target="_blank">localhost:5000</a></p>
+                    {% if firebase_saved %}
+                    <p style="color:#4ade80;">✔ Saved to Firebase cloud database.</p>
+                    {% else %}
+                    <p style="color:#4ade80;">✔ Saved locally to <strong>customers.json</strong> (ready to use in Chatbot)!</p>
+                    {% endif %}
+                </div>
+                {% endif %}
+                {% if error %}
+                <div style="padding:16px;background:rgba(239,68,68,0.15);border:1px solid #ef4444;border-radius:8px;margin-top:16px;color:#fca5a5;line-height:1.6;">
+                    <strong style="color:#ef4444;font-size:15px;">❌ Eligibility Validation Failed:</strong>
+                    <div>{{ error|safe }}</div>
+                </div>
+                {% endif %}
+
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Automatic Age calculation from Date of Birth
+        const dobInput = document.getElementById('dob');
+        const ageInput = document.getElementById('age');
+        if (dobInput && ageInput) {
+            dobInput.addEventListener('change', function() {
+                if (!this.value) return;
+                const bdate = new Date(this.value);
+                const today = new Date();
+                let age = today.getFullYear() - bdate.getFullYear();
+                const m = today.getMonth() - bdate.getMonth();
+                if (m < 0 || (m === 0 && today.getDate() < bdate.getDate())) {
+                    age--;
+                }
+                if (!isNaN(age) && age >= 0) {
+                    ageInput.value = age;
+                }
+            });
+        }
+    </script>
+</body>
+
+</html>
