@@ -93,5 +93,31 @@
     "credit_score": 780,
     "pre_approved_limit": 600000,
     "current_loan_status": "0"
+  },
+  "cust2323232322": {
+    "customer_id": "cust2323232322",
+    "name": "No",
+    "phone": "2323232322",
+    "email": "itspriyanshu.er@gmail.com",
+    "age": 34,
+    "city": "Delhi",
+    "pannumber": "ABCD2323E",
+    "salary": 90000,
+    "credit_score": 800,
+    "pre_approved_limit": 1350000,
+    "current_loan_status": "0"
+  },
+  "cust9999999999": {
+    "customer_id": "cust9999999999",
+    "name": "Geeta",
+    "phone": "9999999999",
+    "email": "abhinavranakoti0509@gmail.com",
+    "age": 28,
+    "city": "Delhi",
+    "pannumber": "ABCD0000E",
+    "salary": 60000,
+    "credit_score": 800,
+    "pre_approved_limit": 900000,
+    "current_loan_status": "0"
   }
 }
