@@ -30,6 +30,9 @@ function initTheme() {
 }
 
 function toggleTheme() {
+    if (window.LoanAIMotion && typeof window.LoanAIMotion.triggerThemeTransition === "function") {
+        window.LoanAIMotion.triggerThemeTransition();
+    }
     const currentTheme = document.documentElement.getAttribute("data-theme") || "dark";
     const newTheme = currentTheme === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", newTheme);
@@ -211,7 +214,7 @@ function switchSession(targetSessionId) {
 
     if (target.messages && target.messages.length > 0) {
         target.messages.forEach(msg => {
-            renderMessageNode(msg.text, msg.sender, msg.time || "");
+            renderMessageNode(msg.text, msg.sender, msg.time || "", false, false);
         });
     } else {
         if (emptyState) {
@@ -273,12 +276,19 @@ sendBtn.addEventListener("click", sendMessage);
 
 // ── Interactive Suggestion Cards & Quick Profiles ──
 document.querySelectorAll(".suggestion-card").forEach(card => {
-    card.addEventListener("click", () => {
+    function activateSuggestion() {
         const promptText = card.getAttribute("data-prompt");
         if (promptText) {
             inputField.value = promptText;
             adjustTextareaHeight();
             sendMessage();
+        }
+    }
+    card.addEventListener("click", activateSuggestion);
+    card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            activateSuggestion();
         }
     });
 });
@@ -596,9 +606,9 @@ function addMessage(text, sender, useTypewriter = true) {
     renderMessageNode(text, sender, timeStr, useTypewriter);
 }
 
-function renderMessageNode(text, sender, timeStr, useTypewriter = false) {
+function renderMessageNode(text, sender, timeStr, useTypewriter = false, animateEnter = true) {
     const group = document.createElement("div");
-    group.className = `message-group ${sender}`;
+    group.className = `message-group ${sender}${animateEnter ? "" : " no-enter-anim"}`;
 
     // Avatar SVG Icons
     const avatar = document.createElement("div");
@@ -699,9 +709,10 @@ function formatMessage(text) {
     let clean = sanitizeMessage(text);
 
     let formatted = clean
+        .replace(/^\s*[-*]\s+(.*)/gm, "• $1")
         .replace(/\n/g, "<br>")
         .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-        .replace(/^\s*[-*]\s+(.*)/gm, "• $1");
+        .replace(/(^|[\s(>])\*([^*\n]+?)\*(?=[\s.,!?;:)<]|$)/g, "$1<em>$2</em>");
 
     // Single-pass replacement for status chips (prevents recursive tag nesting)
     formatted = formatted.replace(/\b(Preliminary Eligible|Under Review|Final Approved|Pre-Approved|Approved|Verification Successful|KYC Verified|Rejected|Rejection)\b/gi, (match) => {
@@ -737,6 +748,11 @@ function createLoanAILogo(options = {}) {
 }
 
 function setGeneratingState(isGenerating) {
+    document.body.classList.toggle("ai-generating", isGenerating);
+    const statusText = document.getElementById("systemStatusText");
+    if (statusText) {
+        statusText.textContent = isGenerating ? "Thinking..." : "AI Ready";
+    }
     const sidebarLogo = document.getElementById("sidebarBrandLogo");
     if (sidebarLogo) {
         if (isGenerating) {
@@ -748,6 +764,11 @@ function setGeneratingState(isGenerating) {
 }
 function typeWriterEffect(element, rawText, speed = 14) {
     const clean = sanitizeMessage(rawText);
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        element.innerHTML = formatMessage(clean);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        return;
+    }
     const words = clean.split(/\s+/);
     let index = 0;
     let accumulated = "";
