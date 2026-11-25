@@ -16,6 +16,12 @@ from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+from monitoring import (
+    AIMonitoringStore,
+    classify_intent_category,
+    extract_gemini_token_usage,
+    sanitize_error_reason,
+)
 
 try:
     from fpdf import FPDF
@@ -107,25 +113,38 @@ DUMMY_CUSTOMERS = {
     },
 }
 
-# ── LLM Initialization ──
+# ── LLM Initialization & Resolved Model Tracking ──
+SECONDARY_MODEL_NAME = "gemini-3.5-flash-lite"
+ACTIVE_MODEL_NAME = MODEL_NAME if MODEL_NAME != "gemini-2.5-flash" else SECONDARY_MODEL_NAME
+LLM_INIT_ERROR = None
 llm = None
 if ChatGoogleGenerativeAI and API_KEY:
     try:
-        # Default to gemini-3.5-flash-lite or user-configured model
-        active_model = MODEL_NAME if MODEL_NAME != "gemini-2.5-flash" else "gemini-3.5-flash-lite"
         llm = ChatGoogleGenerativeAI(
-            model=active_model,
+            model=ACTIVE_MODEL_NAME,
             google_api_key=API_KEY,
             temperature=MODEL_TEMP,
             safety_settings=None,
             timeout=10
         )
-        print(f"[INFO] Google Gemini API loaded with model: {active_model}")
+        print(f"[INFO] Google Gemini API loaded with model: {ACTIVE_MODEL_NAME}")
     except Exception as e:
+        LLM_INIT_ERROR = str(e)
         print(f"[WARNING] LLM could not be loaded: {e}. Using local fallback agent.")
         llm = None
 else:
     print("[INFO] No Gemini API key set. Running in local fallback mode.")
+
+monitoring_store = AIMonitoringStore(
+    local_path=os.environ.get("MONITORING_STATS_PATH", "monitoring_stats.json"),
+    firebase_db_url=FIREBASE_DB_URL,
+    firebase_api_key=FIREBASE_API_KEY,
+    configured_model=MODEL_NAME,
+    active_model=ACTIVE_MODEL_NAME,
+    secondary_model=SECONDARY_MODEL_NAME,
+    llm_available=(llm is not None),
+    init_error=LLM_INIT_ERROR,
+)
 
 LLM_SYSTEM_PROMPT = """
 You are the Supervisor Agent for an AI Loan Sales & Approval assistant that coordinates three worker agents internally:
@@ -1126,12 +1145,18 @@ def local_master_agent(session_id, text):
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    start_ts = time.perf_counter()
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
     user_input = data.get("user_input", "").strip()
+    request_id = data.get("request_id") or None
 
     if not user_input:
-        return jsonify({"response_text": "Please type a message.", "orchestration_command": None})
+        return jsonify({
+            "response_text": "Please type a message.",
+            "orchestration_command": None,
+            "monitoring": monitoring_store.get_snapshot(session_id),
+        })
 
     if not session_id:
         session_id = f"sess_{int(time.time())}"
@@ -1141,7 +1166,7 @@ def chat():
     hist = get_session_history(session_id)
     hist.append(HumanMessage(content=user_input))
 
-    # Route through local agent if onboarding is active, triggered, or LLM is not configured
+    # Classify deterministic routing vs conversational Gemini routing
     t_lower = user_input.lower().strip()
     is_onboarding_active = bool(session_data.get(session_id, {}).get("onboarding_state"))
     is_onboarding_trigger = any(p in t_lower for p in [
@@ -1160,23 +1185,75 @@ def chat():
     is_cust_id = bool(re.search(r"\bcust\w+", t_lower))
     is_verified_and_amount = bool(session_data.get(session_id, {}).get("customer_id") and parse_loan_amount_text(user_input))
 
-    if is_onboarding_active or is_onboarding_trigger or is_logout or is_structured_query or is_cust_id or is_verified_and_amount or not llm:
+    is_rule_routed = (
+        is_onboarding_active
+        or is_onboarding_trigger
+        or is_logout
+        or is_structured_query
+        or is_cust_id
+        or is_verified_and_amount
+    )
+
+    intent_category = classify_intent_category(user_input, {
+        "is_onboarding_active": is_onboarding_active,
+        "is_onboarding_trigger": is_onboarding_trigger,
+        "is_logout": is_logout,
+        "is_structured_query": is_structured_query,
+        "is_cust_id": is_cust_id,
+        "is_verified_and_amount": is_verified_and_amount,
+    })
+
+    # Telemetry accumulators for this turn
+    engine_category = "local_rules"
+    model_used = "local_master_agent"
+    token_usage = None
+    gemini_attempts = 0
+    gemini_successes = 0
+    gemini_failures = 0
+    fallback_reason = None
+
+    raw_llm_model = getattr(llm, "model", None) if llm is not None else None
+    resolved_primary = raw_llm_model.replace("models/", "") if isinstance(raw_llm_model, str) and raw_llm_model else ACTIVE_MODEL_NAME
+
+    monitoring_store.update_runtime_config(
+        firebase_db_url=FIREBASE_DB_URL,
+        firebase_api_key=FIREBASE_API_KEY,
+        active_model=resolved_primary,
+        llm_available=(llm is not None),
+        init_error=LLM_INIT_ERROR,
+    )
+
+    if is_rule_routed:
         text = local_master_agent(session_id, user_input)
+        engine_category = "local_rules"
+        model_used = "local_master_agent"
+    elif not llm:
+        text = local_master_agent(session_id, user_input)
+        engine_category = "local_error_fallback"
+        model_used = "local_master_agent"
+        fallback_reason = LLM_INIT_ERROR or "Gemini API unavailable / not configured"
     else:
         try:
+            gemini_attempts += 1
             res = llm.invoke(hist)
             text = getattr(res, "content", "")
             if isinstance(text, (list, dict)):
                 text = str(text)
+            gemini_successes += 1
+            token_usage = extract_gemini_token_usage(res)
+            engine_category = "gemini_primary"
+            model_used = resolved_primary
         except Exception as e:
+            gemini_failures += 1
             err_msg = str(e)
-            print(f"[WARNING] Primary LLM ({MODEL_NAME}) error: {err_msg}.")
-            # If quota exceeded or error occurred, attempt fallback to flash-lite if different
+            print(f"[WARNING] Primary LLM ({resolved_primary}) error: {err_msg}.")
             fallback_res = None
-            if MODEL_NAME != "gemini-3.5-flash-lite" and ChatGoogleGenerativeAI and API_KEY:
+
+            if resolved_primary != SECONDARY_MODEL_NAME and ChatGoogleGenerativeAI and API_KEY:
                 try:
+                    gemini_attempts += 1
                     fallback_llm = ChatGoogleGenerativeAI(
-                        model="gemini-3.5-flash-lite",
+                        model=SECONDARY_MODEL_NAME,
                         google_api_key=API_KEY,
                         temperature=MODEL_TEMP,
                         safety_settings=None,
@@ -1186,14 +1263,40 @@ def chat():
                     fallback_res = getattr(res2, "content", "")
                     if isinstance(fallback_res, (list, dict)):
                         fallback_res = str(fallback_res)
-                    print("[INFO] Fallback to gemini-3.5-flash-lite succeeded.")
+                    gemini_successes += 1
+                    token_usage = extract_gemini_token_usage(res2)
+                    engine_category = "gemini_secondary"
+                    model_used = SECONDARY_MODEL_NAME
+                    fallback_reason = err_msg
+                    print(f"[INFO] Fallback to {SECONDARY_MODEL_NAME} succeeded.")
                 except Exception as e2:
+                    gemini_failures += 1
+                    err_msg = str(e2) or err_msg
                     print(f"[WARNING] Fallback LLM error: {e2}.")
-            if fallback_res:
+
+            if fallback_res is not None:
                 text = fallback_res
             else:
                 print("[INFO] Falling back to local deterministic supervisor.")
                 text = local_master_agent(session_id, user_input)
+                engine_category = "local_error_fallback"
+                model_used = "local_master_agent"
+                fallback_reason = err_msg
+
+    latency_ms = (time.perf_counter() - start_ts) * 1000.0
+    monitoring_store.record_event(
+        session_id=session_id,
+        engine_category=engine_category,
+        latency_ms=latency_ms,
+        request_id=request_id,
+        intent_category=intent_category,
+        model_used=model_used,
+        token_usage=token_usage,
+        gemini_attempts=gemini_attempts,
+        gemini_failures=gemini_failures,
+        gemini_successes=gemini_successes,
+        fallback_reason=fallback_reason,
+    )
 
     hist.append(AIMessage(content=text))
     save_message_to_firebase(session_id, "bot", text)
@@ -1201,11 +1304,20 @@ def chat():
     # Check if the response contains an orchestration command
     m = re.search(r"\[\[FLASK_CALL:([A-Z_]+)\]\]", text)
     cmd = f"[[FLASK_CALL:{m.group(1)}]]" if m else None
+    snapshot = monitoring_store.get_snapshot(session_id)
 
     if cmd:
-        return jsonify({"response_text": "Processing request...", "orchestration_command": cmd})
+        return jsonify({
+            "response_text": "Processing request...",
+            "orchestration_command": cmd,
+            "monitoring": snapshot,
+        })
 
-    return jsonify({"response_text": text, "orchestration_command": None})
+    return jsonify({
+        "response_text": text,
+        "orchestration_command": None,
+        "monitoring": snapshot,
+    })
 
 
 @app.route("/orchestrate", methods=["POST"])
@@ -1315,12 +1427,33 @@ def index():
     return render_template("chat.html")
 
 
+@app.route("/api/monitoring")
+def api_monitoring():
+    """Return real-time AI engine status, exact token counts, and engine distribution."""
+    session_id = request.args.get("session_id")
+    raw_llm_model = getattr(llm, "model", None) if llm is not None else None
+    resolved_primary = raw_llm_model.replace("models/", "") if isinstance(raw_llm_model, str) and raw_llm_model else ACTIVE_MODEL_NAME
+    monitoring_store.update_runtime_config(
+        firebase_db_url=FIREBASE_DB_URL,
+        firebase_api_key=FIREBASE_API_KEY,
+        active_model=resolved_primary,
+        llm_available=(llm is not None),
+        init_error=LLM_INIT_ERROR,
+    )
+    return jsonify(monitoring_store.get_snapshot(session_id))
+
+
 @app.route("/health")
 def health():
     """Health check endpoint – useful for debugging."""
+    snapshot = monitoring_store.get_snapshot()
     return jsonify({
         "status": "ok",
         "llm_ready": llm is not None,
+        "active_model": snapshot["engine_status"]["active_model"],
+        "gemini_status": snapshot["engine_status"]["gemini_status"],
+        "local_fallback_status": snapshot["engine_status"]["local_fallback_status"],
+        "persistence_mode": snapshot["engine_status"]["persistence_mode"],
         "firebase_configured": bool(FIREBASE_DB_URL),
         "email_configured": bool(GMAIL_USER and GMAIL_APP_PASSWORD),
         "dummy_customers": list(DUMMY_CUSTOMERS.keys())

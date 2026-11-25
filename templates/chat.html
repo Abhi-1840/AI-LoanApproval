@@ -133,6 +133,31 @@
 
             <!-- Sidebar Footer -->
             <div class="sidebar-footer">
+                <!-- Live AI Engine Quick Status Card -->
+                <button class="sidebar-monitor-card" id="sidebarMonitorBtn" type="button" title="Open AI Engine & Token Usage Dashboard">
+                    <div class="smc-header">
+                        <span class="smc-title">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                            </svg>
+                            <span>AI Engine Monitor</span>
+                        </span>
+                        <span class="smc-open-hint">Dashboard →</span>
+                    </div>
+                    <div class="smc-row">
+                        <span class="smc-label">Gemini API</span>
+                        <span class="engine-state-pill state-active" id="sidebarGeminiPill">ACTIVE</span>
+                    </div>
+                    <div class="smc-row">
+                        <span class="smc-label">Local Fallback</span>
+                        <span class="engine-state-pill state-standby" id="sidebarFallbackPill">STANDBY</span>
+                    </div>
+                    <div class="smc-meta">
+                        <span id="sidebarModelLabel">Model: gemini-3.5-flash-lite</span>
+                        <span id="sidebarLastEngine">Idle</span>
+                    </div>
+                </button>
+
                 <a href="http://localhost:5001" target="_blank" class="footer-link-btn" title="Open Admin Panel on port 5001">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <rect x="3" y="3" width="7" height="7"></rect>
@@ -188,14 +213,21 @@
                     </button>
                     <div class="chat-title-group">
                         <h1 class="chat-title">AI Loan Approval Assistant</h1>
-                        <span class="engine-badge" id="engineBadge">
+                        <button class="engine-badge engine-badge-btn" id="engineBadge" type="button" title="View AI Engine & Token Telemetry Dashboard">
                             <span class="ai-indicator-dot" aria-hidden="true"></span>
-                            <span>Underwriting Agent v2.5</span>
-                        </span>
+                            <span id="headerEngineText">Underwriting Agent</span>
+                            <span class="header-model-chip" id="headerModelChip">gemini-3.5-flash-lite</span>
+                        </button>
                     </div>
                 </div>
 
                 <div class="header-actions">
+                    <button class="icon-btn action-text-btn monitor-trigger-btn" id="openMonitorBtn" type="button" title="Open AI Engine & Token Telemetry">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                        </svg>
+                        <span class="monitor-btn-label">Monitor</span>
+                    </button>
                     <button class="icon-btn theme-toggle-btn" id="topThemeToggle" title="Switch Theme (Light / Dark)" aria-label="Switch Theme">
                         <svg class="sun-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="12" cy="12" r="5"></circle>
@@ -333,6 +365,181 @@
             </div>
 
         </main>
+
+        <!-- Monitoring Drawer Backdrop -->
+        <div class="monitor-backdrop" id="monitoringBackdrop"></div>
+
+        <!-- Slide-Over AI Engine & Token Monitoring Dashboard -->
+        <aside class="monitor-drawer" id="monitoringDrawer" aria-label="AI Engine and Token Usage Monitoring Dashboard" aria-hidden="true">
+            <div class="monitor-header">
+                <div class="monitor-title-wrap">
+                    <div class="monitor-title-row">
+                        <span class="ai-indicator-dot" aria-hidden="true"></span>
+                        <h2>AI Engine Telemetry</h2>
+                    </div>
+                    <p class="monitor-subtitle" id="monitorPersistenceMeta">Real-time execution &amp; Gemini metadata tracker</p>
+                </div>
+                <div class="monitor-header-actions">
+                    <button class="icon-btn" id="refreshMonitorBtn" type="button" title="Refresh Telemetry" aria-label="Refresh Telemetry">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                        </svg>
+                    </button>
+                    <button class="icon-btn" id="closeMonitorBtn" type="button" title="Close Telemetry Panel" aria-label="Close Telemetry Panel">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Session vs All-Time View Switcher -->
+            <div class="monitor-scope-bar">
+                <div class="scope-segmented" role="tablist" aria-label="Monitoring Scope">
+                    <button class="scope-tab active" id="scopeSessionBtn" data-scope="session" role="tab" aria-selected="true" type="button">Current Session</button>
+                    <button class="scope-tab" id="scopeAllTimeBtn" data-scope="all_time" role="tab" aria-selected="false" type="button">All-Time Project</button>
+                </div>
+                <span class="scope-session-tag" id="monitorScopeLabel">Session</span>
+            </div>
+
+            <div class="monitor-body">
+                <!-- A. Live AI Engine Status Panel -->
+                <section class="monitor-section">
+                    <div class="monitor-section-head">
+                        <span>Live Engine Status</span>
+                        <span class="storage-mode-chip" id="monitorStorageMode">local_json</span>
+                    </div>
+                    <div class="status-grid">
+                        <div class="status-tile">
+                            <span class="tile-label">Gemini API</span>
+                            <span class="engine-state-pill state-active" id="dashGeminiStatus">ACTIVE</span>
+                        </div>
+                        <div class="status-tile">
+                            <span class="tile-label">Local Fallback</span>
+                            <span class="engine-state-pill state-standby" id="dashFallbackStatus">STANDBY</span>
+                        </div>
+                        <div class="status-tile wide">
+                            <span class="tile-label">Resolved Model</span>
+                            <code class="tile-code" id="dashActiveModel">gemini-3.5-flash-lite</code>
+                        </div>
+                        <div class="status-tile wide">
+                            <span class="tile-label">Most Recent Engine</span>
+                            <span class="tile-value-text" id="dashLastEngine">No requests yet</span>
+                        </div>
+                        <div class="status-tile">
+                            <span class="tile-label">Latest Latency</span>
+                            <span class="tile-value-mono" id="dashLatestLatency">0 ms</span>
+                        </div>
+                        <div class="status-tile">
+                            <span class="tile-label">Last Gemini Success</span>
+                            <span class="tile-value-mono" id="dashLastGeminiAt">Never</span>
+                        </div>
+                    </div>
+
+                    <div class="fallback-alert" id="dashFallbackBanner" hidden>
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <line x1="12" y1="8" x2="12" y2="12"></line>
+                            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                        </svg>
+                        <div>
+                            <strong>Fallback Reason:</strong>
+                            <span id="dashFallbackReason">None</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- B. Actual Gemini Token Counters & Request KPIs -->
+                <section class="monitor-section">
+                    <div class="monitor-section-head">
+                        <span>Gemini Token Usage (Actual Metadata)</span>
+                        <span class="zero-rule-tag">0 tokens for local rules</span>
+                    </div>
+                    <div class="kpi-grid kpi-grid-3">
+                        <div class="kpi-card">
+                            <span class="kpi-label">Input Tokens</span>
+                            <span class="kpi-value" id="kpiInputTokens">0</span>
+                        </div>
+                        <div class="kpi-card">
+                            <span class="kpi-label">Output Tokens</span>
+                            <span class="kpi-value" id="kpiOutputTokens">0</span>
+                        </div>
+                        <div class="kpi-card accent">
+                            <span class="kpi-label">Total Tokens</span>
+                            <span class="kpi-value" id="kpiTotalTokens">0</span>
+                        </div>
+                    </div>
+
+                    <div class="kpi-grid kpi-grid-2">
+                        <div class="kpi-card">
+                            <span class="kpi-label">Gemini API Calls</span>
+                            <span class="kpi-value" id="kpiGeminiRequests">0</span>
+                            <span class="kpi-sub" id="kpiGeminiSplitSub">0 ok • 0 failed</span>
+                        </div>
+                        <div class="kpi-card">
+                            <span class="kpi-label">Avg Latency</span>
+                            <span class="kpi-value" id="kpiAvgLatency">0 ms</span>
+                            <span class="kpi-sub" id="kpiLatencySub">Gemini: 0 ms • Local: 0 ms</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- C. 4-Path Engine Distribution Chart -->
+                <section class="monitor-section">
+                    <div class="monitor-section-head">
+                        <span>Processing Distribution</span>
+                        <span class="split-headline" id="distSplitHeadline">0% Gemini • 0% Local</span>
+                    </div>
+
+                    <div class="dist-stacked-bar" aria-label="Engine Processing Distribution Bar">
+                        <div class="dist-seg seg-gemini-primary" id="segGeminiPrimary" style="width: 0%" title="Primary Gemini Model"></div>
+                        <div class="dist-seg seg-gemini-secondary" id="segGeminiSecondary" style="width: 0%" title="Secondary Gemini Model"></div>
+                        <div class="dist-seg seg-local-rules" id="segLocalRules" style="width: 0%" title="Local Python Rules"></div>
+                        <div class="dist-seg seg-local-fallback" id="segLocalFallback" style="width: 0%" title="Local Error Fallback"></div>
+                    </div>
+
+                    <div class="dist-legend">
+                        <div class="legend-row">
+                            <span class="legend-left"><span class="legend-dot dot-gemini-primary"></span>Primary Gemini Model</span>
+                            <span class="legend-val" id="valGeminiPrimary">0 (0%)</span>
+                        </div>
+                        <div class="legend-row">
+                            <span class="legend-left"><span class="legend-dot dot-gemini-secondary"></span>Secondary Gemini Model</span>
+                            <span class="legend-val" id="valGeminiSecondary">0 (0%)</span>
+                        </div>
+                        <div class="legend-row">
+                            <span class="legend-left"><span class="legend-dot dot-local-rules"></span>Local Python Rules</span>
+                            <span class="legend-val" id="valLocalRules">0 (0%)</span>
+                        </div>
+                        <div class="legend-row">
+                            <span class="legend-left"><span class="legend-dot dot-local-fallback"></span>Local Error Fallback</span>
+                            <span class="legend-val" id="valLocalFallback">0 (0%)</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- D. Recent Request History -->
+                <section class="monitor-section">
+                    <div class="monitor-section-head">
+                        <span>Recent Request Log</span>
+                        <span class="kpi-sub" id="recentCountLabel">0 events</span>
+                    </div>
+                    <div class="recent-log-list" id="recentLogList">
+                        <div class="recent-empty">Send a message to inspect live engine routing and Gemini token telemetry.</div>
+                    </div>
+                </section>
+
+                <!-- E. Official Quota Source & Accuracy Notice -->
+                <div class="quota-transparency-note">
+                    <strong>Quota &amp; Data Notice:</strong> Percentages above show request routing split, not remaining quota. The Gemini API does not expose account RPM/TPM/RPD limits. Visit
+                    <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer">Google AI Studio</a>
+                    for official account-level quotas. No full prompts or customer PII are stored here.
+                </div>
+            </div>
+        </aside>
     </div>
 
     <script src="/static/js/motion.js"></script>

@@ -701,6 +701,364 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
         self.assertIn("This is an initial eligibility estimate based on your monthly net salary (15x salary). Final loan approval is subject to CIBIL verification, age eligibility, FOIR calculation, document verification and the lender's final assessment.", text)
         self.assertNotIn("Eligible Loan Limit", text)
 
+    # ────────────────────────────────────────────────────────────────
+    # 10. AI Engine & Token Monitoring Dashboard Tests
+    # ────────────────────────────────────────────────────────────────
+    def _create_isolated_store(self, tmp_path, **kwargs):
+        from monitoring import AIMonitoringStore
+        return AIMonitoringStore(
+            local_path=tmp_path,
+            configured_model=kwargs.get("configured_model", "gemini-3.5-flash-lite"),
+            active_model=kwargs.get("active_model", "gemini-3.5-flash-lite"),
+            secondary_model=kwargs.get("secondary_model", "gemini-3.5-flash-lite"),
+            llm_available=kwargs.get("llm_available", True),
+            firebase_db_url=kwargs.get("firebase_db_url", ""),
+            firebase_api_key=kwargs.get("firebase_api_key", ""),
+        )
+
+    def test_48_gemini_success_token_usage_and_no_cost_fields(self):
+        """Scenario 1 & 5: Primary Gemini success records exact usage_metadata tokens without cost estimates."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "stats.json")
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(stats_path, llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="Personal loans carry fixed 12% p.a. interest here.",
+                    usage_metadata={"input_tokens": 142, "output_tokens": 28, "total_tokens": 170},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                resp = self.client.post("/chat", json={
+                    "session_id": "sess_mon_gemini_ok",
+                    "user_input": "How does compounding work on your personal loans?",
+                    "request_id": "req_gemini_ok_1",
+                })
+                self.assertEqual(resp.status_code, 200)
+                data = resp.get_json()
+                mon = data["monitoring"]
+
+                self.assertEqual(mon["engine_status"]["gemini_status"], "ACTIVE")
+                self.assertEqual(mon["engine_status"]["local_fallback_status"], "STANDBY")
+                self.assertEqual(mon["engine_status"]["active_model"], "gemini-3.5-flash-lite")
+                self.assertIsNotNone(mon["engine_status"]["last_gemini_success_at"])
+                self.assertEqual(mon["session"]["tokens"]["input_tokens"], 142)
+                self.assertEqual(mon["session"]["tokens"]["output_tokens"], 28)
+                self.assertEqual(mon["session"]["tokens"]["total_tokens"], 170)
+                self.assertEqual(mon["session"]["requests"]["gemini_api_requests"], 1)
+                self.assertEqual(mon["session"]["requests"]["gemini_success_count"], 1)
+                self.assertEqual(mon["session"]["requests"]["gemini_failure_count"], 0)
+                self.assertEqual(mon["session"]["breakdown"]["gemini_primary"], 1)
+                self.assertEqual(mon["session"]["percentages"]["gemini_pct"], 100.0)
+                # Ensure no cost/monetary keys exist anywhere in monitoring payload
+                mon_serialized = json.dumps(mon).lower()
+                self.assertNotIn("estimated_cost", mon_serialized)
+                self.assertNotIn("usd", mon_serialized)
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_49_gemini_unavailable_routes_to_local_error_fallback(self):
+        """Scenario 2: When Gemini llm is None, conversational input uses local_error_fallback with 0 tokens."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "stats.json")
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(stats_path, llm_available=False)
+                main_app.llm = None
+
+                resp = self.client.post("/chat", json={
+                    "session_id": "sess_mon_unavail",
+                    "user_input": "Tell me something helpful about loan tenure",
+                    "request_id": "req_unavail_1",
+                })
+                self.assertEqual(resp.status_code, 200)
+                mon = resp.get_json()["monitoring"]
+
+                self.assertEqual(mon["engine_status"]["gemini_status"], "INACTIVE")
+                self.assertEqual(mon["engine_status"]["local_fallback_status"], "ACTIVE")
+                self.assertEqual(mon["session"]["breakdown"]["local_error_fallback"], 1)
+                self.assertEqual(mon["session"]["breakdown"]["local_rules"], 0)
+                self.assertEqual(mon["session"]["tokens"]["total_tokens"], 0)
+                self.assertEqual(mon["session"]["requests"]["gemini_api_requests"], 0)
+                self.assertIn("unavailable", (mon["engine_status"]["fallback_reason"] or "").lower())
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_50_gemini_quota_rate_limit_error_and_secondary_fallback(self):
+        """Scenario 3: Quota 429 triggers secondary model / local fallback and marks Gemini ERROR cleanly."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "stats.json")
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(stats_path, llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.side_effect = RuntimeError("429 ResourceExhausted: Quota exceeded for key AIzaSySecretKeyShouldNotLeak12345")
+                main_app.llm = mock_llm
+
+                resp = self.client.post("/chat", json={
+                    "session_id": "sess_mon_429",
+                    "user_input": "Explain prepayment charges in plain language",
+                    "request_id": "req_429_1",
+                })
+                self.assertEqual(resp.status_code, 200)
+                mon = resp.get_json()["monitoring"]
+
+                self.assertEqual(mon["engine_status"]["gemini_status"], "ERROR")
+                self.assertEqual(mon["engine_status"]["local_fallback_status"], "ACTIVE")
+                self.assertEqual(mon["session"]["requests"]["gemini_api_requests"], 1)
+                self.assertEqual(mon["session"]["requests"]["gemini_failure_count"], 1)
+                self.assertEqual(mon["session"]["breakdown"]["local_error_fallback"], 1)
+                self.assertEqual(mon["session"]["tokens"]["total_tokens"], 0)
+                reason = mon["engine_status"]["fallback_reason"] or ""
+                self.assertIn("quota", reason.lower())
+                self.assertNotIn("AIzaSy", json.dumps(mon))
+
+                # Also verify secondary Gemini model path when active model differs from secondary model
+                mock_pro = MagicMock()
+                mock_pro.model = "models/gemini-2.5-pro"
+                mock_pro.invoke.side_effect = RuntimeError("429 ResourceExhausted")
+                main_app.llm = mock_pro
+                with patch("app.ChatGoogleGenerativeAI") as mock_ctor, patch.object(main_app, "API_KEY", "test_key"):
+                    mock_sec = MagicMock()
+                    mock_sec.invoke.return_value = SimpleNamespace(
+                        content="Prepayment details clarified.",
+                        usage_metadata={"input_tokens": 90, "output_tokens": 12, "total_tokens": 102},
+                        response_metadata={},
+                    )
+                    mock_ctor.return_value = mock_sec
+
+                    resp2 = self.client.post("/chat", json={
+                        "session_id": "sess_mon_429",
+                        "user_input": "Can I close my loan early?",
+                        "request_id": "req_sec_2",
+                    })
+                    mon2 = resp2.get_json()["monitoring"]
+                    self.assertEqual(mon2["engine_status"]["gemini_status"], "ACTIVE")
+                    self.assertEqual(mon2["session"]["breakdown"]["gemini_secondary"], 1)
+                    self.assertEqual(mon2["session"]["requests"]["gemini_api_requests"], 3)
+                    self.assertEqual(mon2["session"]["requests"]["gemini_failure_count"], 2)
+                    self.assertEqual(mon2["session"]["requests"]["gemini_success_count"], 1)
+                    self.assertEqual(mon2["session"]["tokens"]["total_tokens"], 102)
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_51_local_rule_engine_distinct_from_fallback_and_zero_tokens(self):
+        """Scenario 4: Deterministic rule queries count under local_rules with 0 Gemini tokens/attempts."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "stats.json")
+            orig_store = main_app.monitoring_store
+            try:
+                main_app.monitoring_store = self._create_isolated_store(stats_path, llm_available=True)
+
+                resp = self.client.post("/chat", json={
+                    "session_id": "sess_mon_rules",
+                    "user_input": "Calculate EMI for 500000",
+                    "request_id": "req_rule_1",
+                })
+                self.assertEqual(resp.status_code, 200)
+                mon = resp.get_json()["monitoring"]
+
+                self.assertEqual(mon["session"]["breakdown"]["local_rules"], 1)
+                self.assertEqual(mon["session"]["breakdown"]["local_error_fallback"], 0)
+                self.assertEqual(mon["session"]["requests"]["gemini_api_requests"], 0)
+                self.assertEqual(mon["session"]["tokens"]["total_tokens"], 0)
+                self.assertEqual(mon["session"]["percentages"]["local_pct"], 100.0)
+                self.assertEqual(mon["engine_status"]["gemini_status"], "ACTIVE")
+                self.assertEqual(mon["engine_status"]["local_fallback_status"], "STANDBY")
+            finally:
+                main_app.monitoring_store = orig_store
+
+    def test_52_idempotent_request_id_prevents_duplicate_counting(self):
+        """Idempotency: Retrying with the same request_id never double-counts tokens or requests."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "stats.json")
+            store = self._create_isolated_store(stats_path, llm_available=True)
+
+            first = store.record_event(
+                session_id="sess_dup",
+                engine_category="gemini_primary",
+                latency_ms=215.4,
+                request_id="req_unique_999",
+                token_usage={"input_tokens": 50, "output_tokens": 20, "total_tokens": 70},
+                gemini_attempts=1,
+                gemini_successes=1,
+            )
+            duplicate = store.record_event(
+                session_id="sess_dup",
+                engine_category="gemini_primary",
+                latency_ms=215.4,
+                request_id="req_unique_999",
+                token_usage={"input_tokens": 50, "output_tokens": 20, "total_tokens": 70},
+                gemini_attempts=1,
+                gemini_successes=1,
+            )
+            self.assertTrue(first)
+            self.assertFalse(duplicate)
+            snap = store.get_snapshot("sess_dup")
+            self.assertEqual(snap["all_time"]["tokens"]["total_tokens"], 70)
+            self.assertEqual(snap["all_time"]["requests"]["total_user_messages"], 1)
+            self.assertEqual(snap["all_time"]["requests"]["gemini_api_requests"], 1)
+
+    def test_53_persistence_across_flask_restart_and_firebase_sync(self):
+        """Scenario 6: Stats persist after simulated Flask restart and sync cleanly to Firebase RTDB."""
+        import tempfile
+        from monitoring import AIMonitoringStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "persist.json")
+
+            store1 = self._create_isolated_store(stats_path, llm_available=True)
+            store1.record_event(
+                session_id="sess_restart_a",
+                engine_category="gemini_primary",
+                latency_ms=180.0,
+                request_id="req_persist_1",
+                token_usage={"input_tokens": 110, "output_tokens": 45, "total_tokens": 155},
+                gemini_attempts=1,
+                gemini_successes=1,
+            )
+            store1.record_event(
+                session_id="sess_restart_a",
+                engine_category="local_rules",
+                latency_ms=4.2,
+                request_id="req_persist_2",
+            )
+
+            # Simulate Flask restart by instantiating a brand new store reading the same persisted file
+            store2 = AIMonitoringStore(local_path=stats_path, llm_available=True)
+            snap2 = store2.get_snapshot("sess_restart_a")
+            self.assertEqual(snap2["all_time"]["tokens"]["input_tokens"], 110)
+            self.assertEqual(snap2["all_time"]["tokens"]["output_tokens"], 45)
+            self.assertEqual(snap2["all_time"]["tokens"]["total_tokens"], 155)
+            self.assertEqual(snap2["all_time"]["breakdown"]["gemini_primary"], 1)
+            self.assertEqual(snap2["all_time"]["breakdown"]["local_rules"], 1)
+            self.assertEqual(snap2["session"]["requests"]["total_user_messages"], 2)
+            # Duplicate replay after restart is still prevented
+            self.assertFalse(store2.record_event(
+                session_id="sess_restart_a",
+                engine_category="gemini_primary",
+                latency_ms=100.0,
+                request_id="req_persist_1",
+                token_usage={"input_tokens": 110, "output_tokens": 45, "total_tokens": 155},
+                gemini_attempts=1,
+                gemini_successes=1,
+            ))
+
+            # Verify mocked Firebase RTDB persistence path
+            fb_memory = {}
+
+            def fake_get(url, timeout=3):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = fb_memory.get("monitoring")
+                return resp
+
+            def fake_put(url, json=None, timeout=3):
+                resp = MagicMock()
+                resp.status_code = 200
+                if "/monitoring/global.json" in url:
+                    fb_memory.setdefault("monitoring", {})["global"] = json
+                elif "/monitoring/sessions/" in url:
+                    sess_key = url.split("/monitoring/sessions/")[1].split(".json")[0]
+                    fb_memory.setdefault("monitoring", {}).setdefault("sessions", {})[sess_key] = json
+                elif "/monitoring/processed_request_ids.json" in url:
+                    fb_memory.setdefault("monitoring", {})["processed_request_ids"] = json
+                return resp
+
+            with patch("monitoring.requests.get", side_effect=fake_get), patch("monitoring.requests.put", side_effect=fake_put):
+                fb_store = AIMonitoringStore(
+                    local_path="",
+                    firebase_db_url="https://demo-project.firebaseio.com",
+                    firebase_api_key="dummy_fb_key",
+                    llm_available=True,
+                )
+                fb_store.record_event(
+                    session_id="sess_fb",
+                    engine_category="gemini_primary",
+                    latency_ms=140.0,
+                    request_id="req_fb_1",
+                    token_usage={"input_tokens": 80, "output_tokens": 20, "total_tokens": 100},
+                    gemini_attempts=1,
+                    gemini_successes=1,
+                )
+                fb_restarted = AIMonitoringStore(
+                    local_path="",
+                    firebase_db_url="https://demo-project.firebaseio.com",
+                    firebase_api_key="dummy_fb_key",
+                    llm_available=True,
+                )
+                fb_snap = fb_restarted.get_snapshot("sess_fb")
+                self.assertEqual(fb_snap["engine_status"]["persistence_mode"], "firebase+local")
+                self.assertEqual(fb_snap["all_time"]["tokens"]["total_tokens"], 100)
+                self.assertEqual(fb_snap["session"]["requests"]["gemini_api_requests"], 1)
+
+    def test_54_monitoring_endpoint_session_vs_all_time_views(self):
+        """Scenario 7: /api/monitoring returns independent session and cumulative all_time views."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_path = os.path.join(tmpdir, "views.json")
+            orig_store = main_app.monitoring_store
+            try:
+                store = self._create_isolated_store(stats_path, llm_available=True)
+                main_app.monitoring_store = store
+
+                store.record_event(
+                    session_id="sess_view_1",
+                    engine_category="gemini_primary",
+                    latency_ms=200.0,
+                    request_id="req_v1",
+                    token_usage={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+                    gemini_attempts=1,
+                    gemini_successes=1,
+                )
+                store.record_event(
+                    session_id="sess_view_2",
+                    engine_category="local_rules",
+                    latency_ms=5.0,
+                    request_id="req_v2",
+                )
+
+                r1 = self.client.get("/api/monitoring?session_id=sess_view_1")
+                self.assertEqual(r1.status_code, 200)
+                d1 = r1.get_json()
+                self.assertEqual(d1["session"]["tokens"]["total_tokens"], 125)
+                self.assertEqual(d1["session"]["requests"]["total_user_messages"], 1)
+                self.assertEqual(d1["all_time"]["tokens"]["total_tokens"], 125)
+                self.assertEqual(d1["all_time"]["requests"]["total_user_messages"], 2)
+                self.assertEqual(d1["all_time"]["percentages"]["gemini_pct"], 50.0)
+                self.assertEqual(d1["all_time"]["percentages"]["local_pct"], 50.0)
+
+                r2 = self.client.get("/api/monitoring?session_id=sess_view_2")
+                d2 = r2.get_json()
+                self.assertEqual(d2["session"]["tokens"]["total_tokens"], 0)
+                self.assertEqual(d2["session"]["breakdown"]["local_rules"], 1)
+                self.assertEqual(d2["all_time"]["tokens"]["total_tokens"], 125)
+            finally:
+                main_app.monitoring_store = orig_store
+
 
 if __name__ == "__main__":
     unittest.main()

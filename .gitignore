@@ -36,10 +36,11 @@ $RECYCLE.BIN/
 *.sublime-workspace
 *.sublime-project
 
-# Installer and runtime logs
+# Installer and runtime logs & telemetry caches
 *.log
 pip-log.txt
 pip-delete-this-directory.txt
+monitoring_stats*.json
 
 # Unit test and coverage reports
 htmlcov/

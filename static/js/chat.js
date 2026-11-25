@@ -224,6 +224,7 @@ function switchSession(targetSessionId) {
     }
 
     renderSidebarSessions();
+    fetchMonitoringSnapshot();
 
     // Close mobile drawer if open
     if (sidebarBackdrop && sidebarBackdrop.classList.contains("show")) {
@@ -322,6 +323,7 @@ window.onload = async function () {
     } else {
         await startNewChat();
     }
+    fetchMonitoringSnapshot();
 };
 
 async function startNewChat() {
@@ -342,6 +344,7 @@ async function startNewChat() {
     inputField.value = "";
     adjustTextareaHeight();
     renderSidebarSessions();
+    fetchMonitoringSnapshot();
 }
 
 newChatBtn.addEventListener("click", startNewChat);
@@ -392,17 +395,25 @@ async function sendMessage() {
     addTyping();
 
     try {
+        const clientReqId = "req_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
         const resp = await fetch("/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 session_id: session_id,
-                user_input: text
+                user_input: text,
+                request_id: clientReqId
             })
         });
 
         const data = await resp.json();
         removeTyping();
+
+        if (data.monitoring) {
+            updateMonitoringDashboard(data.monitoring);
+        } else {
+            fetchMonitoringSnapshot();
+        }
 
         if (data.orchestration_command) {
             await handleOrchestration(data.orchestration_command, text);
@@ -831,5 +842,270 @@ function removeTyping() {
     if (typingDiv) {
         typingDiv.remove();
         typingDiv = null;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// AI ENGINE & TOKEN MONITORING DASHBOARD CONTROLLER
+// ──────────────────────────────────────────────────────────────────────────
+const monitoringDrawer = document.getElementById("monitoringDrawer");
+const monitoringBackdrop = document.getElementById("monitoringBackdrop");
+const openMonitorBtn = document.getElementById("openMonitorBtn");
+const sidebarMonitorBtn = document.getElementById("sidebarMonitorBtn");
+const engineBadgeBtn = document.getElementById("engineBadge");
+const closeMonitorBtn = document.getElementById("closeMonitorBtn");
+const refreshMonitorBtn = document.getElementById("refreshMonitorBtn");
+const scopeSessionBtn = document.getElementById("scopeSessionBtn");
+const scopeAllTimeBtn = document.getElementById("scopeAllTimeBtn");
+
+let activeMonitorScope = "session";
+let lastMonitoringSnapshot = null;
+
+function openMonitoringDrawer() {
+    if (!monitoringDrawer) return;
+    monitoringDrawer.classList.add("open");
+    monitoringDrawer.setAttribute("aria-hidden", "false");
+    if (monitoringBackdrop) monitoringBackdrop.classList.add("show");
+    fetchMonitoringSnapshot();
+}
+
+function closeMonitoringDrawer() {
+    if (!monitoringDrawer) return;
+    monitoringDrawer.classList.remove("open");
+    monitoringDrawer.setAttribute("aria-hidden", "true");
+    if (monitoringBackdrop) monitoringBackdrop.classList.remove("show");
+}
+
+if (openMonitorBtn) openMonitorBtn.addEventListener("click", openMonitoringDrawer);
+if (sidebarMonitorBtn) sidebarMonitorBtn.addEventListener("click", openMonitoringDrawer);
+if (engineBadgeBtn) engineBadgeBtn.addEventListener("click", openMonitoringDrawer);
+if (closeMonitorBtn) closeMonitorBtn.addEventListener("click", closeMonitoringDrawer);
+if (monitoringBackdrop) monitoringBackdrop.addEventListener("click", closeMonitoringDrawer);
+if (refreshMonitorBtn) refreshMonitorBtn.addEventListener("click", () => fetchMonitoringSnapshot());
+
+if (scopeSessionBtn && scopeAllTimeBtn) {
+    scopeSessionBtn.addEventListener("click", () => {
+        activeMonitorScope = "session";
+        scopeSessionBtn.classList.add("active");
+        scopeSessionBtn.setAttribute("aria-selected", "true");
+        scopeAllTimeBtn.classList.remove("active");
+        scopeAllTimeBtn.setAttribute("aria-selected", "false");
+        if (lastMonitoringSnapshot) updateMonitoringDashboard(lastMonitoringSnapshot);
+    });
+
+    scopeAllTimeBtn.addEventListener("click", () => {
+        activeMonitorScope = "all_time";
+        scopeAllTimeBtn.classList.add("active");
+        scopeAllTimeBtn.setAttribute("aria-selected", "true");
+        scopeSessionBtn.classList.remove("active");
+        scopeSessionBtn.setAttribute("aria-selected", "false");
+        if (lastMonitoringSnapshot) updateMonitoringDashboard(lastMonitoringSnapshot);
+    });
+}
+
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && monitoringDrawer && monitoringDrawer.classList.contains("open")) {
+        closeMonitoringDrawer();
+    }
+});
+
+async function fetchMonitoringSnapshot() {
+    try {
+        const qs = session_id ? `?session_id=${encodeURIComponent(session_id)}` : "";
+        const resp = await fetch(`/api/monitoring${qs}`);
+        if (!resp.ok) return;
+        const snapshot = await resp.json();
+        updateMonitoringDashboard(snapshot);
+    } catch (err) {
+        // Ignore transient network failures
+    }
+}
+
+function escapeMonitorHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function applyEngineStatePill(el, statusText) {
+    if (!el) return;
+    const upper = String(statusText || "").toUpperCase();
+    el.textContent = upper;
+    el.classList.remove("state-active", "state-standby", "state-inactive", "state-error");
+    if (upper === "ACTIVE") {
+        el.classList.add("state-active");
+    } else if (upper === "STANDBY") {
+        el.classList.add("state-standby");
+    } else if (upper === "ERROR") {
+        el.classList.add("state-error");
+    } else {
+        el.classList.add("state-inactive");
+    }
+}
+
+function setMetricText(el, nextValue) {
+    if (!el) return;
+    const nextStr = String(nextValue);
+    if (el.textContent !== nextStr) {
+        el.textContent = nextStr;
+        el.classList.remove("kpi-updated");
+        void el.offsetWidth;
+        el.classList.add("kpi-updated");
+    }
+}
+
+function formatMonitorTimestamp(isoStr) {
+    if (!isoStr) return "Never";
+    const d = new Date(isoStr);
+    if (Number.isNaN(d.getTime())) return String(isoStr);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function updateMonitoringDashboard(snapshot) {
+    if (!snapshot || !snapshot.engine_status) return;
+    lastMonitoringSnapshot = snapshot;
+
+    const st = snapshot.engine_status;
+    const view = activeMonitorScope === "all_time" ? snapshot.all_time : snapshot.session;
+    if (!view) return;
+
+    // Header & Sidebar Quick Indicators
+    const headerModelChip = document.getElementById("headerModelChip");
+    if (headerModelChip) headerModelChip.textContent = st.active_model || "unconfigured";
+
+    const sidebarGeminiPill = document.getElementById("sidebarGeminiPill");
+    const sidebarFallbackPill = document.getElementById("sidebarFallbackPill");
+    const sidebarModelLabel = document.getElementById("sidebarModelLabel");
+    const sidebarLastEngine = document.getElementById("sidebarLastEngine");
+
+    applyEngineStatePill(sidebarGeminiPill, st.gemini_status);
+    applyEngineStatePill(sidebarFallbackPill, st.local_fallback_status);
+    if (sidebarModelLabel) sidebarModelLabel.textContent = `Model: ${st.active_model || "N/A"}`;
+    if (sidebarLastEngine) sidebarLastEngine.textContent = st.last_engine_label || "Idle";
+
+    // Drawer Status Grid
+    applyEngineStatePill(document.getElementById("dashGeminiStatus"), st.gemini_status);
+    applyEngineStatePill(document.getElementById("dashFallbackStatus"), st.local_fallback_status);
+
+    const dashActiveModel = document.getElementById("dashActiveModel");
+    if (dashActiveModel) dashActiveModel.textContent = st.active_model || "unconfigured";
+
+    const dashLastEngine = document.getElementById("dashLastEngine");
+    if (dashLastEngine) dashLastEngine.textContent = view.last_engine_label || st.last_engine_label || "No requests yet";
+
+    const dashLatestLatency = document.getElementById("dashLatestLatency");
+    if (dashLatestLatency) dashLatestLatency.textContent = `${view.latency.latest_ms || 0} ms`;
+
+    const dashLastGeminiAt = document.getElementById("dashLastGeminiAt");
+    if (dashLastGeminiAt) {
+        dashLastGeminiAt.textContent = formatMonitorTimestamp(view.last_gemini_success_at || st.last_gemini_success_at);
+    }
+
+    const storageChip = document.getElementById("monitorStorageMode");
+    if (storageChip) storageChip.textContent = st.persistence_mode || "local_json";
+
+    const scopeLabel = document.getElementById("monitorScopeLabel");
+    if (scopeLabel) {
+        scopeLabel.textContent = activeMonitorScope === "all_time"
+            ? `${view.requests.total_user_messages} total turns`
+            : (snapshot.session_id || "Session");
+    }
+
+    // Fallback Reason Alert Banner
+    const fallbackBanner = document.getElementById("dashFallbackBanner");
+    const fallbackReasonEl = document.getElementById("dashFallbackReason");
+    const activeReason = view.fallback_reason || st.fallback_reason;
+    if (fallbackBanner && fallbackReasonEl) {
+        if (activeReason) {
+            fallbackBanner.hidden = false;
+            fallbackReasonEl.textContent = activeReason;
+        } else {
+            fallbackBanner.hidden = true;
+            fallbackReasonEl.textContent = "";
+        }
+    }
+
+    // Actual Token & Latency KPIs (zero monetary estimates)
+    setMetricText(document.getElementById("kpiInputTokens"), Number(view.tokens.input_tokens || 0).toLocaleString());
+    setMetricText(document.getElementById("kpiOutputTokens"), Number(view.tokens.output_tokens || 0).toLocaleString());
+    setMetricText(document.getElementById("kpiTotalTokens"), Number(view.tokens.total_tokens || 0).toLocaleString());
+
+    setMetricText(document.getElementById("kpiGeminiRequests"), Number(view.requests.gemini_api_requests || 0).toLocaleString());
+    const splitSub = document.getElementById("kpiGeminiSplitSub");
+    if (splitSub) {
+        splitSub.textContent = `${view.requests.gemini_success_count || 0} ok • ${view.requests.gemini_failure_count || 0} failed`;
+    }
+
+    setMetricText(document.getElementById("kpiAvgLatency"), `${view.latency.avg_ms || 0} ms`);
+    const latSub = document.getElementById("kpiLatencySub");
+    if (latSub) {
+        latSub.textContent = `Gemini: ${view.latency.gemini_avg_ms || 0} ms • Local: ${view.latency.local_avg_ms || 0} ms`;
+    }
+
+    // Processing Distribution Chart
+    const brk = view.breakdown || {};
+    const pct = view.percentages || {};
+    const dist = pct.distribution || {};
+
+    const distHeadline = document.getElementById("distSplitHeadline");
+    if (distHeadline) {
+        distHeadline.textContent = `${pct.gemini_pct || 0}% Gemini • ${pct.local_pct || 0}% Local`;
+    }
+
+    const segGP = document.getElementById("segGeminiPrimary");
+    const segGS = document.getElementById("segGeminiSecondary");
+    const segLR = document.getElementById("segLocalRules");
+    const segLF = document.getElementById("segLocalFallback");
+    if (segGP) segGP.style.width = `${dist.gemini_primary || 0}%`;
+    if (segGS) segGS.style.width = `${dist.gemini_secondary || 0}%`;
+    if (segLR) segLR.style.width = `${dist.local_rules || 0}%`;
+    if (segLF) segLF.style.width = `${dist.local_error_fallback || 0}%`;
+
+    const valGP = document.getElementById("valGeminiPrimary");
+    const valGS = document.getElementById("valGeminiSecondary");
+    const valLR = document.getElementById("valLocalRules");
+    const valLF = document.getElementById("valLocalFallback");
+    if (valGP) valGP.textContent = `${brk.gemini_primary || 0} (${dist.gemini_primary || 0}%)`;
+    if (valGS) valGS.textContent = `${brk.gemini_secondary || 0} (${dist.gemini_secondary || 0}%)`;
+    if (valLR) valLR.textContent = `${brk.local_rules || 0} (${dist.local_rules || 0}%)`;
+    if (valLF) valLF.textContent = `${brk.local_error_fallback || 0} (${dist.local_error_fallback || 0}%)`;
+
+    // Recent Request Feed
+    const recentList = document.getElementById("recentLogList");
+    const recentCountLabel = document.getElementById("recentCountLabel");
+    const events = Array.isArray(view.recent_requests) ? view.recent_requests : [];
+    if (recentCountLabel) recentCountLabel.textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+
+    if (recentList) {
+        if (events.length === 0) {
+            recentList.innerHTML = `<div class="recent-empty">Send a message to inspect live engine routing and Gemini token telemetry.</div>`;
+        } else {
+            recentList.innerHTML = events.map((ev) => {
+                const cat = escapeMonitorHtml(ev.engine_category || "local_rules");
+                const label = escapeMonitorHtml(ev.engine_label || "Unknown");
+                const model = escapeMonitorHtml(ev.model_used || "");
+                const intent = escapeMonitorHtml((ev.intent_category || "").replace(/_/g, " "));
+                const reasonHtml = ev.fallback_reason
+                    ? `<div class="recent-reason">${escapeMonitorHtml(ev.fallback_reason)}</div>`
+                    : "";
+                return `
+                    <div class="recent-log-item">
+                        <div class="recent-log-top">
+                            <span class="recent-engine-tag tag-${cat}">${label}</span>
+                            <span class="recent-time">${formatMonitorTimestamp(ev.timestamp)} • ${ev.latency_ms || 0} ms</span>
+                        </div>
+                        <div class="recent-log-meta">
+                            <span>${intent} • <code>${model}</code></span>
+                            <span>${ev.input_tokens || 0} in / ${ev.output_tokens || 0} out (${ev.total_tokens || 0})</span>
+                        </div>
+                        ${reasonHtml}
+                    </div>
+                `;
+            }).join("");
+        }
     }
 }
