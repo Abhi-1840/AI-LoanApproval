@@ -145,7 +145,7 @@
                     {% if firebase_saved %}
                     <p class="save-note">✔ Saved to Firebase cloud database.</p>
                     {% else %}
-                    <p class="save-note">✔ Saved locally to <strong>customers.json</strong> (ready to use in Chatbot)!</p>
+                    <p class="save-note">✔ Saved and ready to use in the AI Loan Chatbot!{% if firebase_error %} <span style="opacity:0.8;">({{ firebase_error }})</span>{% endif %}</p>
                     {% endif %}
                 </div>
                 {% endif %}

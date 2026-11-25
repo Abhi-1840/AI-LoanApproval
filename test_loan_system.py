@@ -1895,6 +1895,59 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
         finally:
             main_app.session_data.pop(sess_id, None)
 
+    def test_74_new_customer_persists_across_serverless_instances(self):
+        """New customer registered via /add-customer remains verifiable after /tmp reset via signed cookie."""
+        phone = "9876501234"
+        cid = f"cust{phone}"
+        sess_id = "sess_new_cust_serverless"
+        try:
+            # Register via integrated /add-customer
+            form_resp = self.client.post("/add-customer", data={
+                "customerName": "Ananya Verma",
+                "phoneNumber": phone,
+                "dob": "1994-06-15",
+                "age": "32",
+                "city": "Bengaluru",
+                "panNumber": "ABCDE9999K",
+                "emailAddress": "ananya@example.com",
+                "salary": "90000",
+                "currentLoan": "0",
+                "creditScore": "785",
+            })
+            self.assertEqual(form_resp.status_code, 200)
+            self.assertIn(b"Customer Added Successfully", form_resp.data)
+
+            # Simulate Vercel container switch where customers.json on disk lacks the newly saved customer
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmpdir:
+                empty_runtime = os.path.join(tmpdir, "empty_customers.json")
+                orig_runtime = main_app.RUNTIME_CUSTOMERS_FILE
+                orig_bundled = main_app.BUNDLED_CUSTOMERS_FILE
+                try:
+                    main_app.RUNTIME_CUSTOMERS_FILE = empty_runtime
+                    main_app.BUNDLED_CUSTOMERS_FILE = empty_runtime
+                    main_app.session_data.clear()
+
+                    kyc = self.client.post("/orchestrate", json={
+                        "step": "VERIFY_KYC",
+                        "session_id": sess_id,
+                        "customer_info": {"customer_id": cid},
+                    }).get_json()
+                    self.assertEqual(kyc["status"], "success")
+                    self.assertEqual(kyc["customer_data"]["name"], "Ananya Verma")
+                    self.assertEqual(kyc["customer_data"]["credit_score"], 785)
+
+                    # Wipe in-memory session_data again and confirm dashboard still works on next container
+                    main_app.session_data.clear()
+                    dash = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+                    self.assertTrue(dash["verified"])
+                    self.assertEqual(dash["customer"]["customer_id"], cid)
+                finally:
+                    main_app.RUNTIME_CUSTOMERS_FILE = orig_runtime
+                    main_app.BUNDLED_CUSTOMERS_FILE = orig_bundled
+        finally:
+            main_app.session_data.pop(sess_id, None)
+
 
 if __name__ == "__main__":
     unittest.main()

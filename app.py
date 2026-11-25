@@ -74,15 +74,15 @@ else:
     print(f"[INFO] {CONFIG_PATH} not found. Checking environment variables.")
 
 # Read from environment variables first, falling back to config.json
-FIREBASE_DB_URL = os.environ.get("FIREBASE_DATABASE_URL", config.get("firebase_database_url", "")).rstrip("/")
-FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", config.get("firebase_api_key", ""))
-API_KEY = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", config.get("gemini_api_key", "")))
-MODEL_NAME = os.environ.get("LLM_MODEL", config.get("llm_model", "gemini-3.5-flash-lite"))
-MODEL_TEMP = float(os.environ.get("LLM_TEMPERATURE", config.get("llm_temperature", 0.7)))
+FIREBASE_DB_URL = (os.environ.get("FIREBASE_DATABASE_URL") or config.get("firebase_database_url", "")).strip().rstrip("/")
+FIREBASE_API_KEY = (os.environ.get("FIREBASE_API_KEY") or config.get("firebase_api_key", "")).strip()
+API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or config.get("gemini_api_key", "")).strip()
+MODEL_NAME = (os.environ.get("LLM_MODEL") or config.get("llm_model", "gemini-3.5-flash-lite")).strip()
+MODEL_TEMP = float(os.environ.get("LLM_TEMPERATURE") or config.get("llm_temperature", 0.7))
 
-GMAIL_USER = os.environ.get("GMAIL_USER", config.get("gmail_user", ""))
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", config.get("gmail_app_password", ""))
-GMAIL_FROM = os.environ.get("GMAIL_FROM", config.get("gmail_from", GMAIL_USER))
+GMAIL_USER = (os.environ.get("GMAIL_USER") or config.get("gmail_user", "")).strip()
+GMAIL_APP_PASSWORD = (os.environ.get("GMAIL_APP_PASSWORD") or config.get("gmail_app_password", "")).replace(" ", "").strip()
+GMAIL_FROM = (os.environ.get("GMAIL_FROM") or config.get("gmail_from", "")).strip() or GMAIL_USER
 
 if API_KEY:
     os.environ["GOOGLE_API_KEY"] = API_KEY
@@ -438,7 +438,20 @@ def verify_kyc(customer_id):
             except Exception:
                 pass
 
-    # 3. Check built-in dummy customers
+    # 3. Check signed browser cookie customer cache (bridges ephemeral /tmp across serverless instances)
+    if has_request_context():
+        try:
+            cookie_customers = session.get("loanai_customers")
+            if isinstance(cookie_customers, dict):
+                match = cookie_customers.get(cid) or cookie_customers.get(customer_id)
+                if isinstance(match, dict):
+                    res = match.copy()
+                    res["status"] = "Verification Successful"
+                    return res
+        except Exception:
+            pass
+
+    # 4. Check built-in dummy customers
     dummy = DUMMY_CUSTOMERS.get(cid)
     if dummy:
         result = dummy.copy()
@@ -602,8 +615,11 @@ def calculate_emi(principal, rate, months):
     return (principal * r * (1 + r) ** months) / ((1 + r) ** months - 1)
 
 def save_customer_to_storage(customer_data):
-    """Save customer to writable customers.json and Firebase (if configured)."""
+    """Save customer to writable customers.json, signed session cookie cache, and Firebase (if configured)."""
     customer_id = customer_data["customer_id"].lower().strip()
+    local_saved = False
+    firebase_saved = False
+    firebase_error = ""
 
     # 1. Save to writable customers.json (seeded from bundled customers.json on serverless)
     local_file = RUNTIME_CUSTOMERS_FILE
@@ -623,11 +639,41 @@ def save_customer_to_storage(customer_data):
             os.makedirs(parent, exist_ok=True)
         with open(local_file, "w") as f:
             json.dump(customers, f, indent=2)
+        local_saved = True
         print(f"[INFO] Customer {customer_id} saved locally in {local_file}")
     except Exception as e:
         print(f"[ERROR] Could not save customer to {local_file}: {e}")
 
-    # 2. Save to Firebase if configured
+    # 2. Persist compact customer record in signed Flask cookie so serverless cold starts / lambda hops retain it
+    if has_request_context():
+        try:
+            cookie_customers = dict(session.get("loanai_customers") or {})
+            compact_customer = {
+                "customer_id": customer_id,
+                "name": customer_data.get("name"),
+                "phone": customer_data.get("phone", ""),
+                "email": customer_data.get("email", ""),
+                "dob": customer_data.get("dob", ""),
+                "age": customer_data.get("age"),
+                "city": customer_data.get("city", ""),
+                "pannumber": customer_data.get("pannumber", ""),
+                "salary": customer_data.get("salary", 0),
+                "credit_score": customer_data.get("credit_score", 0),
+                "pre_approved_limit": customer_data.get("pre_approved_limit", 0),
+                "current_loan_status": str(customer_data.get("current_loan_status", "0")),
+            }
+            cookie_customers.pop(customer_id, None)
+            cookie_customers[customer_id] = compact_customer
+            # Cap at most 5 dynamic customer records so total cookie stays safely under 4KB
+            while len(cookie_customers) > 5:
+                oldest_key = next(iter(cookie_customers))
+                cookie_customers.pop(oldest_key, None)
+            session["loanai_customers"] = cookie_customers
+            session.modified = True
+        except Exception:
+            pass
+
+    # 3. Save to Firebase if configured
     if FIREBASE_DB_URL:
         try:
             url = f"{FIREBASE_DB_URL}/customers/{customer_id}.json"
@@ -638,6 +684,7 @@ def save_customer_to_storage(customer_data):
                     "name": customer_data.get("name"),
                     "phone": customer_data.get("phone"),
                     "email": customer_data.get("email"),
+                    "dob": customer_data.get("dob", ""),
                     "age": customer_data.get("age"),
                     "city": customer_data.get("city"),
                     "pannumber": customer_data.get("pannumber"),
@@ -647,10 +694,22 @@ def save_customer_to_storage(customer_data):
                 "credit_score": customer_data.get("credit_score"),
                 "pre_approved_limit": customer_data.get("pre_approved_limit")
             }
-            requests.put(url, json=fb_payload, timeout=3)
-            print(f"[INFO] Customer {customer_id} saved to Firebase")
+            resp = requests.put(url, json=fb_payload, timeout=3)
+            if resp.status_code == 200:
+                firebase_saved = True
+                print(f"[INFO] Customer {customer_id} saved to Firebase")
+            else:
+                firebase_error = f"Firebase returned HTTP {resp.status_code}"
+                print(f"[WARNING] Firebase customer save failed: {firebase_error}")
         except Exception as e:
+            firebase_error = str(e)
             print(f"[WARNING] Could not save customer to Firebase: {e}")
+
+    return {
+        "local_saved": local_saved,
+        "firebase_saved": firebase_saved,
+        "firebase_error": firebase_error,
+    }
 
 
 def underwrite(customer, loan_amount, tenure=None):
@@ -877,7 +936,10 @@ def send_email_with_attachment(to_email, subject, body, pdf_path):
     Returns (True, None) on success, (False, error_message) on failure.
     """
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        msg = "Email not sent: Gmail credentials not configured in config.json."
+        msg = (
+            "Email not sent: Gmail credentials not configured "
+            "(set GMAIL_USER and GMAIL_APP_PASSWORD in Vercel Environment Variables or config.json)."
+        )
         print(f"[WARNING] {msg}")
         return False, msg
 
@@ -908,7 +970,7 @@ def send_email_with_attachment(to_email, subject, body, pdf_path):
         return True, None
 
     except smtplib.SMTPAuthenticationError:
-        msg = "Email failed: Gmail authentication error. Check gmail_user and gmail_app_password in config.json."
+        msg = "Email failed: Gmail authentication error. Check GMAIL_USER and 16-character GMAIL_APP_PASSWORD."
         print(f"[ERROR] {msg}")
         return False, msg
     except smtplib.SMTPException as e:
@@ -2905,9 +2967,11 @@ def admin_add_customer():
         "pre_approved_limit": salary_int * 15,
         "current_loan_status": str(currentloan_int),
     }
-    save_customer_to_storage(new_customer)
-    firebase_saved = bool(FIREBASE_DB_URL)
-    firebase_error = "" if firebase_saved else "Firebase not configured. Saved to runtime customers store."
+    save_res = save_customer_to_storage(new_customer)
+    firebase_saved = bool(save_res.get("firebase_saved"))
+    firebase_error = save_res.get("firebase_error") or (
+        "" if firebase_saved else "Firebase not configured. Saved to browser session & runtime store."
+    )
     return render_template(
         "form.html",
         success=True,
