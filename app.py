@@ -147,24 +147,22 @@ monitoring_store = AIMonitoringStore(
 )
 
 LLM_SYSTEM_PROMPT = """
-You are the Supervisor Agent for an AI Loan Sales & Approval assistant that coordinates three worker agents internally:
-  1) Verification Agent — verifies customer IDs and fetches customer data.
-  2) Underwriting Agent — calculates EMI, checks limits (loan <= 15x salary, credit >= 700, EMI <= 50% salary), decides Pre-Approve/Approve/Reject.
-  3) Documentation Agent — prepares sanction letter content and confirms document dispatch.
+You are the AI Financial Assistant for the AI Loan Approval System.
 
-RULES (very strict):
-- You must behave as one Supervisor who coordinates the workflow smoothly.
-- If the user provides a customer ID in the format custXXXX (case-insensitive, e.g. cust01, cust8171601302), the Supervisor MUST trigger a backend KYC call by replying with the token: `[[FLASK_CALL:VERIFY_KYC]]` on its own line.
-- After KYC is successful (the backend returns customer profile data), when the user provides a loan amount (e.g. 500000, 5 lakhs), the Supervisor MUST trigger underwriting by replying with: `[[FLASK_CALL:UNDERWRITE]]` on its own line.
-- If the user says they are a new customer or don't have a Customer ID, explain that they can register directly in this chat or follow the onboarding prompts.
-- For general questions (EMI explanations, required documents, eligibility rules, greetings, etc.), respond clearly and concisely as a professional financial assistant (do NOT include any FLASK_CALL tokens).
-- When a loan is approved, confirm: "Sanction letter sent to <email>."
-- Do not expose your internal chain-of-thought or markdown code blocks for system commands.
+PROJECT DEMONSTRATION RULES (factual reference only — NEVER approve/reject loans yourself or modify customer records):
+- Eligibility criteria used by the deterministic Python underwriting engine:
+  1) Age: 21 to 65 years.
+  2) CIBIL / Credit Score: minimum 700 (on the standard 300–900 scale) as this project's demonstration eligibility threshold. Clarify when asked that a higher score reflects stronger repayment history and lower perceived credit risk, while 700 is the configured rule in this demo system rather than a universal cutoff for all external lenders.
+  3) Maximum Loan Limit: up to 15x monthly net salary.
+  4) Affordability (FOIR - Fixed Obligation to Income Ratio): existing monthly EMIs + proposed EMI must not exceed 50% of monthly net salary.
+  5) Tenure: 48 to 72 months at a fixed 12% per annum interest rate.
+  6) Minimum Loan Amount: backend underwriting validates amount > 0 with no arbitrary fixed floor, though practical loan applications are assessed against the 15x cap and 50% FOIR limit.
 
-Output rules summary:
-- To trigger backend KYC: reply with `[[FLASK_CALL:VERIFY_KYC]]` on its own line.
-- To trigger backend underwriting: reply with `[[FLASK_CALL:UNDERWRITE]]` on its own line.
-- Otherwise, reply with friendly, professional conversational text.
+STRICT SAFETY RULES:
+- Answer general, educational, and policy questions clearly, concisely, and accurately in plain conversational language.
+- NEVER emit `[[FLASK_CALL:...]]` tokens, never trigger KYC/underwriting, and never claim a registration or loan approval is complete.
+- NEVER fabricate customer details, credit scores, ages, cities, or loan amounts.
+- If a user is currently partway through registration (onboarding), answer their question helpfully and remind them to provide the requested pending onboarding detail when ready.
 """
 
 def get_session_history(session_id):
@@ -730,17 +728,336 @@ def send_email_with_attachment(to_email, subject, body, pdf_path):
         print(f"[ERROR] {msg}")
         return False, msg
 
+# ── Intent Classification, Validation & Safe Conversational Helpers ──
+
+CUSTOMER_ID_REGEX = re.compile(
+    r"\bcust(?!(?:omer|omers|om|oms|omize|omized|ody)\b)[a-z0-9_]+\b",
+    re.IGNORECASE,
+)
+
+QUESTION_START_REGEX = re.compile(
+    r"^\s*(?:why|what|how|when|where|which|who|explain|tell\s+me|can\s+you|could\s+you|would\s+you|do\s+i|does|is\s+there|are\s+there|is\s+it|should\s+i|will\s+i|could\s+i|am\s+i)\b",
+    re.IGNORECASE,
+)
+
+QUESTION_PHRASE_REGEX = re.compile(
+    r"(?:\?\s*$|\b(?:why\s+(?:do|is|are|does|must|need|more|above|700|21|65|50|pan)|what\s+(?:is|are|does|happens)|how\s+(?:does|do|is|can|long)|mean\s+by|meaning\s+of|difference\s+between|minimum\s+loan|maximum\s+loan|explain\b))",
+    re.IGNORECASE,
+)
+
+NON_LOAN_NUMERIC_CONTEXT_REGEX = re.compile(
+    r"\b(?:cibil|credit\s*score|score|age|years?\s*old|foir|percent|%|\bp\.?\s*a\.?\b|interest\s*rate|roi|pan\b|phone|mobile)\b",
+    re.IGNORECASE,
+)
+
+EXPLICIT_LOAN_REQUEST_REGEX = re.compile(
+    r"\b(?:apply(?:\s+for)?|want\s+(?:to\s+apply|a\s+loan|rs|₹|\d)|need\s+(?:a\s+loan|rs|₹|\d)|borrow|request(?:ing)?|take\s+(?:a\s+)?loan|get\s+(?:a\s+)?loan|loan\s+(?:of|amount)|sanction\s+(?:of|me))\b",
+    re.IGNORECASE,
+)
+
+ONBOARDING_STEP_REMINDERS = {
+    "ASK_NAME": "Please share your **Full Legal Name** to continue registration (or type `'cancel'` to stop).",
+    "ASK_PHONE": "Please share your **10-digit Mobile Number** to continue registration (or type `'cancel'` to stop).",
+    "ASK_EMAIL": "Please share your **Email Address** to continue registration (or type `'cancel'` to stop).",
+    "ASK_AGE_CITY": "Please share your **Age (21–65 yrs)** and **City** of residence (e.g. `28, Mumbai`), or type `'cancel'` to stop.",
+    "ASK_PAN": "Please share your **10-character PAN Number** (e.g. `ABCDE1234F`), or type `'cancel'` to stop.",
+    "ASK_SALARY": "Please share your **Monthly Net Salary** in ₹ (e.g. `50000`), or type `'cancel'` to stop.",
+    "ASK_EXISTING_LOAN": "Please share your **Existing Monthly EMIs** in ₹ (or reply `0` / `none`), or type `'cancel'` to stop.",
+    "ASK_CREDIT_SCORE": "Please provide a valid **CIBIL / Credit Score** (**700–900** required in this system), or type `'cancel'` to stop.",
+}
+
+ONBOARDING_CONTEXT_HINTS = {
+    "ASK_NAME": "Full Legal Name",
+    "ASK_PHONE": "10-digit Mobile Number",
+    "ASK_EMAIL": "Email Address",
+    "ASK_AGE_CITY": "Age (mandatory 21–65 years) and City of residence",
+    "ASK_PAN": "10-character PAN Card Number",
+    "ASK_SALARY": "Monthly Net In-Hand Salary in INR",
+    "ASK_EXISTING_LOAN": "Existing Monthly Loan EMIs in INR (checked against 50% FOIR limit)",
+    "ASK_CREDIT_SCORE": "CIBIL Credit Score (300–900 scale; minimum 700 required by this project's rules)",
+}
+
+
+def is_general_question(text):
+    """
+    Detect informational, educational, or policy questions (e.g. 'Why do I need more than 700?',
+    'What is FOIR?', 'What is the minimum loan amount?') so they are answered conversationally
+    instead of corrupting onboarding fields or triggering loan underwriting.
+    """
+    if not text:
+        return False
+    s = str(text).strip()
+    if QUESTION_START_REGEX.search(s):
+        return True
+    if QUESTION_PHRASE_REGEX.search(s):
+        return True
+    return False
+
+
+def is_onboarding_cancel_command(text):
+    t = (text or "").lower().strip()
+    return bool(re.search(r"\b(?:cancel|stop|abort|exit|quit|start\s+over)\b", t))
+
+
+def is_onboarding_trigger_phrase(text):
+    t = (text or "").lower().strip()
+    return any(p in t for p in [
+        "new customer", "new user", "register me", "sign up", "signup", "create account",
+        "add customer", "add me", "i am new", "i am a new customer",
+        "i don't have customer id", "i dont have customer id", "i don't have an id",
+        "i dont have an id", "no customer id", "no id", "dont have id", "don't have id",
+        "onboard me", "start onboarding", "want to register", "register as",
+    ]) or t == "register"
+
+
+def is_logout_phrase(text):
+    t = (text or "").lower().strip()
+    return any(p in t for p in [
+        "logout", "log out", "switch customer", "change customer", "change user", "sign out", "reset customer"
+    ])
+
+
+def is_profile_lookup_query(text):
+    t = (text or "").lower().strip()
+    return any(p in t for p in [
+        "check limit", "my limit", "what is my limit", "eligible limit", "check my limit",
+        "my profile", "who am i", "my details", "profile details", "account details",
+        "check my profile", "eligibility status"
+    ])
+
+
+def is_emi_calculation_query(text):
+    t = (text or "").lower().strip()
+    if t.startswith("why "):
+        return False
+    return any(p in t for p in [
+        "calculate emi", "emi for", "emi calculation", "calculate loan emi"
+    ]) or ("emi" in t and parse_loan_amount_text(t) is not None and not EXPLICIT_LOAN_REQUEST_REGEX.search(t))
+
+
+def is_structured_faq_query(text):
+    """
+    Match exact deterministic rule/doc FAQs when NOT framed as an explanatory 'why' or general conceptual question.
+    """
+    t = (text or "").lower().strip()
+    if re.search(r"^\s*(?:why|what\s+happens|explain)\b", t):
+        return False
+    if any(w in t for w in ["document", "documents", "docs", "paperwork"]):
+        return True
+    if any(p in t for p in [
+        "eligibility criteria", "eligibility rules", "loan criteria", "loan rules", "qualify", "requirements"
+    ]) and "why" not in t and "minimum loan" not in t:
+        return True
+    return False
+
+
+def parse_strict_numeric_value(text):
+    """
+    Parse an explicit standalone monetary or integer entry cleanly (for salary/EMI fields),
+    without grabbing stray numbers out of conversational questions.
+    """
+    if not text or is_general_question(text):
+        return None
+    s = str(text).strip()
+    # Reject obvious multi-sentence / non-numeric conversational chatter
+    if len(s.split()) > 6 and not re.search(r"(?:salary|emi|income|loan|rs|₹|lakhs?|lacs?|k)\b", s, re.IGNORECASE):
+        return None
+    return parse_loan_amount_text(s)
+
+
+def extract_explicit_cibil_input(text):
+    """
+    Strictly extract an explicitly supplied CIBIL credit score from user input.
+    Never defaults invalid or conversational input to 700/750.
+    Returns (int_score_or_None, reason_code) where reason_code in:
+      'valid_int', 'question', 'skip_not_allowed', 'non_numeric'
+    """
+    if not text:
+        return None, "non_numeric"
+    if is_general_question(text):
+        return None, "question"
+
+    t = str(text).lower().strip()
+    if re.search(r"\b(?:skip|don'?t\s+know|dont\s+know|not\s+sure|na|n/a|none|default)\b", t):
+        return None, "skip_not_allowed"
+
+    # Match standalone integer (e.g. "780", "200", "400") or explicit score phrase (e.g. "cibil 780", "score is 650")
+    standalone = re.match(r"^\s*(\d{1,5})\s*$", t)
+    if standalone:
+        return int(standalone.group(1)), "valid_int"
+
+    score_phrase = re.match(
+        r"^\s*(?:my\s+)?(?:cibil|credit)?\s*(?:score)?\s*(?:is|:|=)?\s*(\d{1,5})\s*(?:score|points?)?\s*$",
+        t,
+    )
+    if score_phrase:
+        return int(score_phrase.group(1)), "valid_int"
+
+    return None, "non_numeric"
+
+
+def extract_explicit_loan_request(text):
+    """
+    Extract (loan_amount, tenure_months, status) ONLY when the user explicitly requests or confirms
+    a loan amount — NEVER from questions, CIBIL/age mentions, or non-loan chatter.
+    status in: 'valid', 'question', 'non_loan_context', 'ambiguous_amount', 'no_amount'
+    """
+    if not text:
+        return None, None, "no_amount"
+    s = str(text).strip()
+
+    if is_general_question(s):
+        return None, None, "question"
+
+    # Extract tenure first and remove the tenure phrase so '60 months' is not parsed as loan amount 60
+    tenure = parse_tenure_months(s)
+    text_no_tenure = re.sub(
+        r"\b(?:for\s+)?\d+\s*(?:years?|yrs?|months?|mos?)\b",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    text_no_tenure = re.sub(r"\btenure\s*(?:of|is|:)?\s*\d+\b", " ", text_no_tenure, flags=re.IGNORECASE).strip()
+
+    has_explicit_intent = bool(EXPLICIT_LOAN_REQUEST_REGEX.search(s))
+    has_non_loan_context = bool(NON_LOAN_NUMERIC_CONTEXT_REGEX.search(s))
+
+    # Numbers paired with score/age/rate/FOIR without explicit loan request intent must never trigger underwriting
+    if has_non_loan_context and not has_explicit_intent:
+        return None, None, "non_loan_context"
+
+    # Parse candidate amount strictly from remaining non-tenure text
+    cleaned = text_no_tenure.lower().replace(",", "").replace("₹", "").replace("rs.", "").replace("rs", "").strip()
+    is_standalone_amount = bool(
+        re.match(
+            r"^(?:loan\s*(?:amount)?\s*(?:is|:|=)?\s*)?\d+(?:\.\d+)?\s*(?:lakhs?|lacs?|l|k)?(?:\s*only)?\.?$",
+            cleaned,
+        )
+    )
+
+    if not is_standalone_amount and not has_explicit_intent:
+        return None, None, "no_amount"
+
+    amt = parse_loan_amount_text(text_no_tenure)
+    if not amt or amt <= 0:
+        return None, None, "no_amount"
+
+    has_currency_or_unit = bool(
+        re.search(r"(?:₹|\brs\.?|\binr\b|\d\s*(?:lakhs?|lacs?|l|k)\b)", s, re.IGNORECASE)
+    )
+
+    # Guard against bare small integers like "700" or "250" typed without loan/currency context
+    if amt < 1000 and not (has_explicit_intent and has_currency_or_unit):
+        return None, None, "ambiguous_amount"
+
+    return amt, tenure, "valid"
+
+
+def sanitize_llm_reply(text):
+    """Strip any stray FLASK_CALL tokens so Gemini cannot trigger backend actions on its own."""
+    if not text:
+        return ""
+    return re.sub(r"\[\[FLASK_CALL:[A-Z_]+\]\]", "", str(text)).strip()
+
+
+def append_onboarding_reminder(reply_text, onboarding_state):
+    """Attach the pending registration question after answering an interruption cleanly."""
+    reminder = ONBOARDING_STEP_REMINDERS.get(onboarding_state)
+    if not reminder:
+        return reply_text
+    return f"{reply_text.rstrip()}\n\n---\n📌 **To continue your registration:** {reminder}"
+
+
+def safe_local_informational_fallback(session_id, text):
+    """
+    Deterministic safe responder used ONLY when Gemini is unavailable or fails.
+    Never modifies onboarding state, never fabricates defaults, never triggers underwriting.
+    """
+    t = (text or "").lower().strip()
+    sess = session_data.get(session_id, {})
+
+    if any(w in t for w in ["700", "cibil", "credit score", "score"]):
+        return (
+            "A **CIBIL score of 700 or above** (on the 300–900 scale) is used as an eligibility threshold because a higher score generally indicates a stronger repayment history and lower perceived credit risk.\n\n"
+            "• Note: **700** is the threshold configured in this project's demonstration underwriting rules, not a universal rule across every external lender."
+        )
+
+    if "foir" in t or "fixed obligation" in t:
+        return (
+            "**FOIR (Fixed Obligation to Income Ratio)** measures how much of your monthly net salary already goes toward debt EMIs:\n\n"
+            "• Formula: `(Existing Monthly EMIs + Proposed Loan EMI) / Monthly Net Salary × 100`\n"
+            "• In this project's rules, total FOIR must be **≤ 50%** so monthly repayments remain affordable."
+        )
+
+    if "minimum loan" in t or ("minimum" in t and "amount" in t):
+        return (
+            "This project's deterministic underwriting engine requires a requested loan amount **greater than ₹0**, subject to:\n\n"
+            "• **Maximum Limit**: Up to **15× your monthly net salary**\n"
+            "• **Affordability (FOIR)**: Total monthly EMIs must stay **≤ 50%** of monthly net salary\n\n"
+            "*(There is no separate hardcoded minimum floor above ₹0 in the code, though practical personal loan requests are typically in thousands or lakhs. Let me know the amount you'd like to check!)*"
+        )
+
+    if "after registration" in t or ("what happens" in t and ("register" in t or "onboarding" in t)) or "how does loan approval work" in t:
+        return (
+            "Once you complete registration cleanly with valid details:\n\n"
+            "1. Your customer profile receives an automatic **Customer ID** (`cust<mobile>`) and a **Preliminary Loan Eligibility** estimate (**15× monthly net salary**).\n"
+            "2. You can then specify the loan amount you wish to apply for (or check EMI first).\n"
+            "3. Our deterministic Python underwriting engine evaluates **Age (21–65), CIBIL (≥ 700), 15× salary limit, Tenure (48–72 months), and FOIR (≤ 50%)**.\n"
+            "4. Approved applications automatically generate a PDF Sanction Letter in `sanctions/` and dispatch it if email is configured."
+        )
+
+    if "document" in t or "docs" in t or "paperwork" in t:
+        return (
+            "📄 **Documents Required for Loan Approval:**\n\n"
+            "1. **Identity Proof**: PAN Card (mandatory) & Aadhaar Card / Passport.\n"
+            "2. **Address Proof**: Aadhaar Card, Utility Bill, or Rental Agreement.\n"
+            "3. **Income Proof**: Last 3 months Salary Slips & Form 16 / ITR.\n"
+            "4. **Bank Statement**: Last 6 months bank statement showing regular salary deposits."
+        )
+
+    if any(w in t for w in ["eligibility", "criteria", "rules", "requirements", "age", "tenure", "interest"]):
+        return (
+            "📋 **Loan Eligibility Criteria (Demonstration Rules):**\n\n"
+            "• **Age**: 21 to 65 years.\n"
+            "• **CIBIL Score**: Minimum 700 (range 300–900).\n"
+            "• **Maximum Loan Limit**: Up to **15× monthly net salary**.\n"
+            "• **FOIR Limit**: Existing EMIs + proposed EMI ≤ **50%** of monthly net salary.\n"
+            "• **Interest Rate**: Fixed 12% per annum.\n"
+            "• **Tenure**: 48 to 72 months."
+        )
+
+    if sess.get("onboarding_state"):
+        return (
+            "I'm currently running in local fallback mode because the Gemini AI service is unavailable, so I can best help with questions about CIBIL rules, FOIR, eligibility limits, or required documents while keeping your registration progress safe."
+        )
+
+    if any(w in t for w in ["hi", "hello", "hey", "help", "good morning", "good evening", "namaste", "options", "menu"]):
+        return (
+            "Hello! 👋 I'm your **AI Loan Approval Assistant**.\n\n"
+            "Here is how I can assist you:\n"
+            "1️⃣ **New Customer Registration**: Type **'I am a new customer'** to register step-by-step.\n"
+            "2️⃣ **Verify Existing Customer**: Enter your Customer ID (e.g. `cust01`, `cust10`).\n"
+            "3️⃣ **Calculate EMI**: Type *'Calculate EMI for ₹5,00,000'*.\n"
+            "4️⃣ **Eligibility & Docs**: Ask about CIBIL 700 threshold, FOIR, minimum/maximum limits, or documents."
+        )
+
+    return (
+        "*(Local Fallback Active — Gemini AI unavailable)* I can reliably assist you with:\n\n"
+        "• Verifying your Customer ID (e.g. `cust01`)\n"
+        "• Registering as a new customer (`I am a new customer`)\n"
+        "• Explaining CIBIL (≥700), FOIR (≤50%), age (21–65), and EMI calculations (`Calculate EMI for ₹5,00,000`)."
+    )
+
+
 # ── Local Fallback Agent & Conversational State Machine ──
 
 def local_master_agent(session_id, text):
     """
-    Intelligent conversational supervisor:
-    - In-chat step-by-step onboarding for new customers (persists to customers.json & Firebase)
-    - Full loan application guidance ("I want to apply for a loan")
-    - Real-time loan limit & profile inspection
-    - Reducing-balance EMI calculators & repayment schedules
-    - Document requirements & eligibility rules guidance
-    - Automatic routing to VERIFY_KYC and UNDERWRITE pipelines
+    Deterministic business & onboarding supervisor:
+    - Strictly validates every onboarding field without fabricated defaults
+    - Never marks registration complete when any mandatory field fails validation
+    - Answers structured queries (KYC, Profile, EMI, Docs, Criteria, Explicit Loan Application)
+    - Uses safe_local_informational_fallback() only when Gemini is unavailable/errors, without mutating state
     """
     t = text.lower().strip()
     sess = session_data.setdefault(session_id, {})
@@ -748,8 +1065,7 @@ def local_master_agent(session_id, text):
 
     # ── 1. ACTIVE IN-CHAT ONBOARDING STATE MACHINE ──
     if onboarding_state:
-        # Check if user wants to cancel
-        if any(w in t for w in ["cancel", "stop", "abort", "exit", "quit", "start over"]):
+        if is_onboarding_cancel_command(text):
             sess["onboarding_state"] = None
             sess["onboarding_data"] = {}
             return (
@@ -758,11 +1074,20 @@ def local_master_agent(session_id, text):
                 "or provide an existing Customer ID (e.g. `cust01`)."
             )
 
+        # Safeguard: if local_master_agent receives a general question during onboarding, answer safely & preserve state
+        if is_general_question(text):
+            faq_answer = safe_local_informational_fallback(session_id, text)
+            return append_onboarding_reminder(faq_answer, onboarding_state)
+
         data = sess.setdefault("onboarding_data", {})
 
         if onboarding_state == "ASK_NAME":
             name = text.strip()
-            if len(name) < 2 or re.match(r"^\d+$", name):
+            if (
+                len(name) < 2
+                or re.match(r"^\d+$", name)
+                or name.lower() in {"hi", "hello", "hey", "help", "ok", "yes", "no"}
+            ):
                 return "Please provide your **Full Legal Name** (e.g., *Rahul Sharma* or *Priya Patel*)."
             data["name"] = name.title()
             sess["onboarding_state"] = "ASK_PHONE"
@@ -777,7 +1102,6 @@ def local_master_agent(session_id, text):
             if len(phone) != 10:
                 return "Please enter a valid **10-digit mobile number** (e.g., *9876543210*)."
 
-            # Check if this customer ID already exists in our records
             existing = verify_kyc(f"cust{phone}")
             if existing.get("status") == "Verification Successful":
                 sess["onboarding_state"] = None
@@ -816,26 +1140,45 @@ def local_master_agent(session_id, text):
             dob_age = calculate_age_from_dob(text)
             if dob_age is not None:
                 age = dob_age
+            elif "pending_age" in data and not re.search(r"\d+", text):
+                age = data["pending_age"]
             else:
-                age_m = re.search(r"\b(1[89]|[2-9][0-9])\b", text)
-                age = int(age_m.group(0)) if age_m else 0
+                age_m = re.search(r"\b(\d{1,3})\b", text)
+                age = int(age_m.group(1)) if age_m else None
 
-            # Validate Age bounds (21 to 65 years)
+            if age is None:
+                return (
+                    "Please provide your **Age** (21–65 years) and **City** of residence "
+                    "(e.g., *28, Mumbai*), or type `'cancel'` to exit."
+                )
+
             if age < 21:
+                data.pop("pending_age", None)
                 return (
                     f"❌ **Eligibility Check Failed (Age)**: Minimum eligible age is **21 years** (maximum 65 years). "
                     f"At {age} years, you do not meet our mandatory age requirement.\n\n"
-                    f"*Please enter an eligible age between 21 and 65 to continue, or type 'cancel' to exit.*"
+                    f"*Please enter an eligible age between 21 and 65 with your city to continue, or type `'cancel'` to exit.*"
                 )
             if age > 65:
+                data.pop("pending_age", None)
                 return (
                     f"❌ **Eligibility Check Failed (Age)**: Maximum eligible age is **65 years**. "
                     f"At {age} years, you exceed our maximum age limit.\n\n"
-                    f"*Please enter an eligible age between 21 and 65 to continue, or type 'cancel' to exit.*"
+                    f"*Please enter an eligible age between 21 and 65 with your city to continue, or type `'cancel'` to exit.*"
                 )
 
-            city_cand = re.sub(r"[\d,.-]", " ", text).strip()
-            city = " ".join([w.capitalize() for w in city_cand.split() if len(w) > 1]) or "Mumbai"
+            city_cand = re.sub(r"\b(?:years?|yrs?|old|age)\b", " ", text, flags=re.IGNORECASE)
+            city_cand = re.sub(r"[\d,./-]", " ", city_cand).strip()
+            city = " ".join([w.capitalize() for w in city_cand.split() if len(w) > 1])
+
+            if not city:
+                data["pending_age"] = age
+                return (
+                    f"Age **{age} yrs** noted. Please also enter your **City** of residence "
+                    "(e.g., *Mumbai* or *Delhi*) — we do not auto-fill missing city fields."
+                )
+
+            data.pop("pending_age", None)
             data["age"] = age
             data["city"] = city
             sess["onboarding_state"] = "ASK_PAN"
@@ -846,8 +1189,8 @@ def local_master_agent(session_id, text):
 
         if onboarding_state == "ASK_PAN":
             pan_clean = re.sub(r"[^A-Za-z0-9]", "", text).upper()
-            if len(pan_clean) < 8:
-                return "Please enter a valid **PAN Number** (e.g., *ABCDE1234F*)."
+            if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", pan_clean):
+                return "Please enter a valid **10-character PAN Number** in format `ABCDE1234F` (5 letters, 4 digits, 1 letter)."
             data["pannumber"] = pan_clean
             sess["onboarding_state"] = "ASK_SALARY"
             return (
@@ -856,22 +1199,27 @@ def local_master_agent(session_id, text):
             )
 
         if onboarding_state == "ASK_SALARY":
-            amt = parse_loan_amount_text(text)
+            amt = parse_strict_numeric_value(text)
             if not amt or amt < 5000:
-                return "Please enter a valid monthly salary figure in numbers (e.g. *50000* or *75000*)."
+                return "Please enter a valid monthly net salary figure in numbers (minimum ₹5,000, e.g. *50000* or *75000*)."
             data["salary"] = int(amt)
             sess["onboarding_state"] = "ASK_EXISTING_LOAN"
             return (
                 "Do you have any **Current Ongoing Monthly Loan EMIs**?\n"
-                "*(Enter the monthly EMI amount e.g. 5000, or reply '0' / 'none' if no active loans)*"
+                "*(Enter the monthly EMI amount e.g. `5000`, or reply `0` / `none` if no active loans)*"
             )
 
         if onboarding_state == "ASK_EXISTING_LOAN":
-            if any(w in t for w in ["no", "none", "na", "nil", "zero", "0"]):
+            if re.search(r"^\s*0+\s*$", t) or re.search(r"\b(?:no|none|nil|zero|n/?a)\b", t):
                 curr_loan = 0
             else:
-                amt = parse_loan_amount_text(text)
-                curr_loan = int(amt) if amt else 0
+                amt = parse_strict_numeric_value(text)
+                if amt is None:
+                    return (
+                        "Please enter a valid numeric monthly EMI obligation (e.g. `5000`), "
+                        "or reply `0` / `none` if you have no existing loans."
+                    )
+                curr_loan = int(amt)
 
             salary = data.get("salary", 0)
             if salary > 0 and (curr_loan / salary) > 0.50:
@@ -879,34 +1227,68 @@ def local_master_agent(session_id, text):
                 return (
                     f"❌ **Eligibility Check Failed (FOIR Limit)**: Existing monthly EMIs of ₹{int(curr_loan):,} account for "
                     f"{foir_pct:.1f}% of your monthly salary (₹{int(salary):,}), which exceeds the mandatory 50% FOIR limit.\n\n"
-                    f"*Please enter a valid monthly EMI obligation (under ₹{int(salary * 0.5):,}, or '0' if none), or type 'cancel' to exit.*"
+                    f"*Please enter a valid monthly EMI obligation (under ₹{int(salary * 0.5):,}, or `0` if none), or type `'cancel'` to exit.*"
                 )
 
             data["current_loan"] = curr_loan
             sess["onboarding_state"] = "ASK_CREDIT_SCORE"
             return (
-                "Lastly, what is your approximate **Credit Score / CIBIL**?\n"
-                "*(e.g., 750 or 800. Must be 700 or above for loan approval)*"
+                "Lastly, what is your **CIBIL / Credit Score**?\n"
+                "*(e.g., `750` or `800`. Valid eligible range in this system: **700–900**)*"
             )
 
         if onboarding_state == "ASK_CREDIT_SCORE":
-            if any(w in t for w in ["skip", "dont know", "not sure", "na", "none", "default"]):
-                credit = 750
-            else:
-                amt = parse_loan_amount_text(text)
-                if amt:
-                    credit = int(amt)
-                else:
-                    credit = 750
+            credit, parse_status = extract_explicit_cibil_input(text)
 
-            if credit < 700:
-                return (
-                    f"❌ **Eligibility Check Failed (CIBIL Score)**: Minimum required CIBIL credit score is **700**. "
-                    f"A credit score of {credit} does not meet our mandatory approval threshold.\n\n"
-                    f"*Please provide a credit score of 700 or above (or type 'cancel' to exit).* "
+            if parse_status == "question":
+                return append_onboarding_reminder(
+                    safe_local_informational_fallback(session_id, text),
+                    onboarding_state,
                 )
 
+            if parse_status == "skip_not_allowed" or credit is None:
+                return (
+                    "A valid **CIBIL credit score** between **700 and 900** is strictly required and cannot be skipped or defaulted.\n\n"
+                    "*Please enter your numeric CIBIL score (e.g. `750`), or type `'cancel'` to exit.*"
+                )
+
+            if credit < 700:
+                data.pop("credit_score", None)
+                return (
+                    f"❌ **Eligibility Check Failed (CIBIL Score)**: Minimum required CIBIL credit score is **700**. "
+                    f"The score you entered (**{credit}**) does not meet our mandatory approval threshold.\n\n"
+                    f"*Please provide an eligible score between **700 and 900** to continue, or type `'cancel'` to exit.*"
+                )
+
+            if credit > 900:
+                data.pop("credit_score", None)
+                return (
+                    f"❌ **Invalid CIBIL Score**: CIBIL scores range up to **900**. "
+                    f"The score you entered (**{credit}**) exceeds 900.\n\n"
+                    f"*Please provide a valid CIBIL score between **700 and 900**, or type `'cancel'` to exit.*"
+                )
+
+            # Store exact validated score (never substituted or defaulted)
             data["credit_score"] = credit
+
+            # ── STRICT PRE-FINALIZATION COMPLETENESS VERIFICATION ──
+            required_checks = [
+                ("name", isinstance(data.get("name"), str) and len(data["name"].strip()) >= 2),
+                ("phone", isinstance(data.get("phone"), str) and data["phone"].isdigit() and len(data["phone"]) == 10),
+                ("email", isinstance(data.get("email"), str) and "@" in data["email"]),
+                ("age", isinstance(data.get("age"), int) and 21 <= data["age"] <= 65),
+                ("city", isinstance(data.get("city"), str) and len(data["city"].strip()) >= 2),
+                ("pannumber", isinstance(data.get("pannumber"), str) and len(data["pannumber"]) == 10),
+                ("salary", isinstance(data.get("salary"), (int, float)) and data["salary"] >= 5000),
+                ("current_loan", isinstance(data.get("current_loan"), (int, float)) and data["current_loan"] >= 0),
+                ("credit_score", isinstance(data.get("credit_score"), int) and 700 <= data["credit_score"] <= 900),
+            ]
+            missing_or_invalid = [field for field, ok in required_checks if not ok]
+            if missing_or_invalid:
+                return (
+                    f"⚠️ Cannot complete registration because required field(s) are incomplete or invalid: "
+                    f"**{', '.join(missing_or_invalid)}**. Please type `'cancel'` to restart onboarding cleanly."
+                )
 
             # ── FINALIZE REGISTRATION ──
             cust_id = f"cust{data['phone']}"
@@ -928,7 +1310,7 @@ def local_master_agent(session_id, text):
             save_customer_to_storage(new_customer)
             new_customer["status"] = "Verification Successful"
 
-            # Immediately link to active session
+            # Immediately link verified profile to active session
             session_data[session_id] = new_customer.copy()
             sess["onboarding_state"] = None
             sess["onboarding_data"] = {}
@@ -952,13 +1334,7 @@ def local_master_agent(session_id, text):
             )
 
     # ── 2. NEW CUSTOMER REGISTRATION TRIGGER ──
-    if any(phrase in t for phrase in [
-        "new customer", "new user", "register", "sign up", "signup", "create account",
-        "add customer", "add me", "register me", "i am new", "i am a new customer",
-        "i don't have customer id", "i dont have customer id", "i don't have an id",
-        "i dont have an id", "no customer id", "no id", "dont have id", "don't have id",
-        "onboard me", "start onboarding"
-    ]):
+    if is_onboarding_trigger_phrase(text):
         if sess.get("customer_id"):
             name = sess.get("name", "Customer")
             cid = sess.get("customer_id")
@@ -976,13 +1352,12 @@ def local_master_agent(session_id, text):
             "To get started, what is your **Full Name**?"
         )
 
-    # ── 3. CUSTOMER ID VERIFICATION TRIGGER (custXXXX) ──
-    m = re.search(r"\bcust\w+", t)
-    if m:
+    # ── 3. CUSTOMER ID VERIFICATION TRIGGER (custXXXX, excluding English 'customer') ──
+    if not is_general_question(text) and CUSTOMER_ID_REGEX.search(t):
         return "[[FLASK_CALL:VERIFY_KYC]]"
 
     # ── 4. LOGOUT / SWITCH CUSTOMER ──
-    if any(phrase in t for phrase in ["logout", "log out", "switch customer", "change customer", "change user", "sign out", "reset customer"]):
+    if is_logout_phrase(text):
         session_data[session_id] = {}
         return (
             "✅ **Logged out successfully.**\n\n"
@@ -992,11 +1367,7 @@ def local_master_agent(session_id, text):
         )
 
     # ── 5. CHECK PROFILE / LIMIT / WHO AM I ──
-    if any(phrase in t for phrase in [
-        "check limit", "my limit", "what is my limit", "eligible limit", "check my limit",
-        "my profile", "who am i", "my details", "profile details", "account details",
-        "check my profile", "eligibility status"
-    ]):
+    if is_profile_lookup_query(text):
         if sess.get("customer_id"):
             name = sess.get("name", "Customer")
             cid = sess.get("customer_id")
@@ -1024,18 +1395,18 @@ def local_master_agent(session_id, text):
             "• If you are new, type **'I am a new customer'** to register and check your limit!"
         )
 
-    # ── 6. "I WANT TO APPLY FOR A LOAN" (LOAN APPLICATION INTENT) ──
-    if any(phrase in t for phrase in [
+    # ── 6. LOAN APPLICATION INTENT ──
+    if (not is_general_question(text)) and any(phrase in t for phrase in [
         "apply for a loan", "apply for loan", "apply loan", "want a loan", "want loan",
         "need a loan", "need loan", "take a loan", "take loan", "get a loan", "get loan",
         "i want to apply", "loan application", "how to apply"
     ]):
-        detected_amt = parse_loan_amount_text(text)
+        detected_amt, _, amt_status = extract_explicit_loan_request(text)
 
         if sess.get("customer_id"):
             name = sess.get("name", "Customer")
             limit = sess.get("pre_approved_limit") or sess.get("salary", 0) * 15
-            if detected_amt:
+            if amt_status == "valid" and detected_amt:
                 return "[[FLASK_CALL:UNDERWRITE]]"
             return (
                 f"Hi **{name}**! 👋 Your profile is registered with preliminary eligibility.\n\n"
@@ -1046,7 +1417,7 @@ def local_master_agent(session_id, text):
                 f"Please enter the loan amount you wish to apply for (e.g. **500000** or **₹3,00,000**) to initiate underwriting review."
             )
         else:
-            if detected_amt:
+            if amt_status == "valid" and detected_amt:
                 sess["pending_loan_amount"] = detected_amt
             return (
                 "I would love to help you apply for an instant personal loan! 🏦\n\n"
@@ -1059,7 +1430,7 @@ def local_master_agent(session_id, text):
             )
 
     # ── 7. EMI CALCULATION PREVIEW ──
-    if any(phrase in t for phrase in ["calculate emi", "emi for", "what is emi", "what is the emi", "emi calculation", "monthly emi"]):
+    if is_emi_calculation_query(text):
         amt = parse_loan_amount_text(text)
         if amt and amt > 1000:
             emi_36 = calculate_emi(amt, 12, 36)
@@ -1082,17 +1453,17 @@ def local_master_agent(session_id, text):
         )
 
     # ── 8. DOCUMENTS & ELIGIBILITY INQUIRIES ──
-    if any(phrase in t for phrase in ["document", "documents", "docs", "paperwork"]):
-        return (
-            "📄 **Documents Required for Loan Approval:**\n\n"
-            "1. **Identity Proof**: PAN Card (mandatory) & Aadhaar Card / Passport.\n"
-            "2. **Address Proof**: Aadhaar Card, Utility Bill, or Rental Agreement.\n"
-            "3. **Income Proof**: Last 3 months Salary Slips & Form 16 / ITR.\n"
-            "4. **Bank Statement**: Last 6 months bank statement showing regular salary deposits.\n\n"
-            "✨ *With our instant automated pipeline, verified customers receive a digital sanction letter within seconds without physical paperwork!*"
-        )
+    if is_structured_faq_query(text):
+        if any(w in t for w in ["document", "documents", "docs", "paperwork"]):
+            return (
+                "📄 **Documents Required for Loan Approval:**\n\n"
+                "1. **Identity Proof**: PAN Card (mandatory) & Aadhaar Card / Passport.\n"
+                "2. **Address Proof**: Aadhaar Card, Utility Bill, or Rental Agreement.\n"
+                "3. **Income Proof**: Last 3 months Salary Slips & Form 16 / ITR.\n"
+                "4. **Bank Statement**: Last 6 months bank statement showing regular salary deposits.\n\n"
+                "✨ *With our instant automated pipeline, verified customers receive a digital sanction letter within seconds without physical paperwork!*"
+            )
 
-    if any(phrase in t for phrase in ["eligibility", "criteria", "rules", "qualify", "requirements"]):
         return (
             "📋 **Loan Eligibility Criteria & Guidelines:**\n\n"
             "• **Age**: 21 to 65 years.\n"
@@ -1104,42 +1475,25 @@ def local_master_agent(session_id, text):
         )
 
     # ── 9. SANCTION LETTER / DISPATCH STATUS ──
-    if sess.get("sanction"):
+    if sess.get("sanction") and not is_general_question(text):
         if any(word in t for word in ["sanction", "letter", "email", "pdf", "status"]):
             s = sess["sanction"]
             return f"✅ Your loan sanction letter (`{s.get('pdf', 'Sanction_Letter.pdf')}`) has been issued and sent to **{s.get('email', 'your email')}**."
 
-    # ── 10. UNDERWRITE TRIGGER (NUMERIC LOAN AMOUNT) ──
+    # ── 10. EXPLICIT LOAN AMOUNT UNDERWRITE TRIGGER ──
     if sess.get("customer_id"):
-        amt = parse_loan_amount_text(text)
-        if amt and amt > 0:
+        amt, _, amt_status = extract_explicit_loan_request(text)
+        if amt_status == "valid" and amt and amt > 0:
             return "[[FLASK_CALL:UNDERWRITE]]"
+        if amt_status == "ambiguous_amount":
+            return (
+                "That number looks ambiguous without loan context. "
+                "Please specify the exact loan amount you want to apply for (e.g., `50000`, `₹5,00,000`, or `I want a loan of ₹3,00,000`)."
+            )
 
-        limit = sess.get("pre_approved_limit") or sess.get("salary", 0) * 15
-        return (
-            f"Please enter the loan amount you wish to apply for (e.g. **500000** or **5 lakhs**).\n"
-            f"Your maximum eligible pre-approved limit is **₹{int(limit):,}**."
-        )
+    # ── 11. SAFE INFORMATIONAL & GENERAL FALLBACK ──
+    return safe_local_informational_fallback(session_id, text)
 
-    # ── 11. GENERAL GREETINGS / HELP FALLBACK ──
-    if any(phrase in t for phrase in ["hi", "hello", "hey", "help", "good morning", "good evening", "namaste", "options", "menu"]):
-        return (
-            "Hello! 👋 I'm your **AI Loan Approval Assistant**.\n\n"
-            "Here is how I can assist you today:\n"
-            "1️⃣ **Apply for a Loan**: Check your pre-approved limit and apply instantly.\n"
-            "2️⃣ **New Customer Registration**: Type **'I am a new customer'** to register directly in chat.\n"
-            "3️⃣ **Verify Existing Customer**: Enter your Customer ID (e.g. `cust01`, `cust10`).\n"
-            "4️⃣ **Calculate EMI**: Type *'Calculate EMI for ₹5,00,000'* for a detailed payment plan.\n"
-            "5️⃣ **Eligibility & Docs**: Ask for eligibility criteria or documents required.\n\n"
-            "How can I help you today?"
-        )
-
-    # Default welcoming prompt
-    return (
-        "Welcome! I'm your **AI Loan Assistant**.\n\n"
-        "• Existing customer? Please provide your **Customer ID** (format: `custXXXX`, e.g. `cust01`).\n"
-        "• New customer? Type **'I am a new customer'** and you can register right here in this chat!"
-    )
 
 # ── Flask Routes ──
 
@@ -1166,36 +1520,53 @@ def chat():
     hist = get_session_history(session_id)
     hist.append(HumanMessage(content=user_input))
 
-    # Classify deterministic routing vs conversational Gemini routing
+    sess = session_data.setdefault(session_id, {})
+    onboarding_state = sess.get("onboarding_state")
     t_lower = user_input.lower().strip()
-    is_onboarding_active = bool(session_data.get(session_id, {}).get("onboarding_state"))
-    is_onboarding_trigger = any(p in t_lower for p in [
-        "new customer", "new user", "register", "sign up", "signup", "create account",
-        "add customer", "add me", "register me", "i am new", "i am a new customer",
-        "i don't have customer id", "i dont have customer id", "i don't have an id",
-        "i dont have an id", "no customer id", "no id", "dont have id", "don't have id",
-        "apply for a loan", "apply loan", "apply for loan", "want a loan", "need a loan"
-    ])
-    is_logout = any(p in t_lower for p in ["logout", "log out", "switch customer", "change customer", "change user", "sign out"])
 
-    is_structured_query = any(p in t_lower for p in [
-        "check my limit", "check limit", "what is my limit", "who am i", "my profile",
-        "calculate emi", "emi for", "documents", "document", "criteria", "eligibility"
+    is_question = is_general_question(user_input)
+    is_cancel = bool(onboarding_state and is_onboarding_cancel_command(user_input))
+    is_onboarding_trigger = (not onboarding_state) and is_onboarding_trigger_phrase(user_input)
+    is_logout = is_logout_phrase(user_input)
+    is_profile_query = is_profile_lookup_query(user_input)
+    is_emi_query = is_emi_calculation_query(user_input)
+    is_structured_faq = is_structured_faq_query(user_input)
+    is_apply_intent = (not onboarding_state) and (not is_question) and any(p in t_lower for p in [
+        "apply for a loan", "apply for loan", "apply loan", "want a loan", "want loan",
+        "need a loan", "need loan", "take a loan", "take loan", "get a loan", "get loan",
+        "i want to apply", "loan application", "how to apply"
     ])
-    is_cust_id = bool(re.search(r"\bcust\w+", t_lower))
-    is_verified_and_amount = bool(session_data.get(session_id, {}).get("customer_id") and parse_loan_amount_text(user_input))
+    is_cust_id = (not onboarding_state) and (not is_question) and bool(CUSTOMER_ID_REGEX.search(t_lower))
 
-    is_rule_routed = (
-        is_onboarding_active
+    extracted_loan_amount = None
+    extracted_tenure = None
+    loan_parse_status = "no_amount"
+    is_verified_and_amount = False
+
+    if (not onboarding_state) and sess.get("customer_id") and (not is_question):
+        extracted_loan_amount, extracted_tenure, loan_parse_status = extract_explicit_loan_request(user_input)
+        is_verified_and_amount = (loan_parse_status == "valid")
+
+    is_onboarding_field_reply = bool(onboarding_state) and (not is_question) and (not is_structured_faq) and (not is_emi_query)
+    is_structured_query = is_profile_query or is_emi_query or is_structured_faq
+
+    # Decide strictly: deterministic Python rules vs conversational Gemini AI
+    should_use_local_rules = (
+        is_cancel
+        or is_onboarding_field_reply
         or is_onboarding_trigger
         or is_logout
-        or is_structured_query
+        or is_profile_query
+        or is_emi_query
+        or is_structured_faq
+        or is_apply_intent
         or is_cust_id
         or is_verified_and_amount
+        or (loan_parse_status == "ambiguous_amount")
     )
 
     intent_category = classify_intent_category(user_input, {
-        "is_onboarding_active": is_onboarding_active,
+        "is_onboarding_active": bool(onboarding_state),
         "is_onboarding_trigger": is_onboarding_trigger,
         "is_logout": is_logout,
         "is_structured_query": is_structured_query,
@@ -1223,22 +1594,50 @@ def chat():
         init_error=LLM_INIT_ERROR,
     )
 
-    if is_rule_routed:
+    if should_use_local_rules:
         text = local_master_agent(session_id, user_input)
+        # If an FAQ/EMI interrupted onboarding, remind the pending step cleanly while preserving state
+        if onboarding_state and (is_structured_faq or is_emi_query) and sess.get("onboarding_state"):
+            text = append_onboarding_reminder(text, sess["onboarding_state"])
         engine_category = "local_rules"
         model_used = "local_master_agent"
     elif not llm:
-        text = local_master_agent(session_id, user_input)
+        base_reply = safe_local_informational_fallback(session_id, user_input)
+        if onboarding_state and sess.get("onboarding_state"):
+            base_reply = append_onboarding_reminder(base_reply, sess["onboarding_state"])
+        text = base_reply
         engine_category = "local_error_fallback"
         model_used = "local_master_agent"
         fallback_reason = LLM_INIT_ERROR or "Gemini API unavailable / not configured"
     else:
+        # Prepare Gemini message list; merge non-PII pending step context into index-0 SystemMessage
+        # (langchain-google-genai only allows SystemMessage at position 0, never mid-conversation)
+        llm_messages = list(hist)
+        if onboarding_state:
+            step_desc = ONBOARDING_CONTEXT_HINTS.get(onboarding_state, onboarding_state)
+            base_sys = llm_messages[0].content if llm_messages and isinstance(llm_messages[0], SystemMessage) else LLM_SYSTEM_PROMPT
+            merged_sys = SystemMessage(
+                content=(
+                    f"{base_sys}\n\n"
+                    f"CURRENT SESSION CONTEXT (mid-registration interruption): "
+                    f"The user paused onboarding at step '{onboarding_state}' ({step_desc}). "
+                    "Answer their informational question concisely and accurately, do NOT complete or reset registration, "
+                    "do NOT invent field values, and do NOT emit any [[FLASK_CALL:...]] tokens."
+                )
+            )
+            if llm_messages and isinstance(llm_messages[0], SystemMessage):
+                llm_messages = [merged_sys] + llm_messages[1:]
+            else:
+                llm_messages = [merged_sys] + llm_messages
+
         try:
             gemini_attempts += 1
-            res = llm.invoke(hist)
-            text = getattr(res, "content", "")
-            if isinstance(text, (list, dict)):
-                text = str(text)
+            res = llm.invoke(llm_messages)
+            raw_reply = getattr(res, "content", "")
+            if isinstance(raw_reply, (list, dict)):
+                raw_reply = str(raw_reply)
+            # Never allow Gemini to inject [[FLASK_CALL:...]] commands autonomously
+            text = sanitize_llm_reply(raw_reply)
             gemini_successes += 1
             token_usage = extract_gemini_token_usage(res)
             engine_category = "gemini_primary"
@@ -1259,10 +1658,11 @@ def chat():
                         safety_settings=None,
                         timeout=10
                     )
-                    res2 = fallback_llm.invoke(hist)
-                    fallback_res = getattr(res2, "content", "")
-                    if isinstance(fallback_res, (list, dict)):
-                        fallback_res = str(fallback_res)
+                    res2 = fallback_llm.invoke(llm_messages)
+                    raw_fallback = getattr(res2, "content", "")
+                    if isinstance(raw_fallback, (list, dict)):
+                        raw_fallback = str(raw_fallback)
+                    fallback_res = sanitize_llm_reply(raw_fallback)
                     gemini_successes += 1
                     token_usage = extract_gemini_token_usage(res2)
                     engine_category = "gemini_secondary"
@@ -1277,11 +1677,15 @@ def chat():
             if fallback_res is not None:
                 text = fallback_res
             else:
-                print("[INFO] Falling back to local deterministic supervisor.")
-                text = local_master_agent(session_id, user_input)
+                print("[INFO] Falling back to safe local informational fallback.")
+                text = safe_local_informational_fallback(session_id, user_input)
                 engine_category = "local_error_fallback"
                 model_used = "local_master_agent"
                 fallback_reason = err_msg
+
+        # After any Gemini or fallback answer during onboarding, remind pending step cleanly without changing state
+        if onboarding_state and sess.get("onboarding_state"):
+            text = append_onboarding_reminder(text, sess["onboarding_state"])
 
     latency_ms = (time.perf_counter() - start_ts) * 1000.0
     monitoring_store.record_event(
@@ -1301,17 +1705,22 @@ def chat():
     hist.append(AIMessage(content=text))
     save_message_to_firebase(session_id, "bot", text)
 
-    # Check if the response contains an orchestration command
+    # Only local rule engine commands are emitted as orchestration_command
     m = re.search(r"\[\[FLASK_CALL:([A-Z_]+)\]\]", text)
     cmd = f"[[FLASK_CALL:{m.group(1)}]]" if m else None
     snapshot = monitoring_store.get_snapshot(session_id)
 
     if cmd:
-        return jsonify({
+        payload = {
             "response_text": "Processing request...",
             "orchestration_command": cmd,
             "monitoring": snapshot,
-        })
+        }
+        if cmd == "[[FLASK_CALL:UNDERWRITE]]" and extracted_loan_amount:
+            payload["loan_amount"] = extracted_loan_amount
+            if extracted_tenure:
+                payload["tenure"] = extracted_tenure
+        return jsonify(payload)
 
     return jsonify({
         "response_text": text,

@@ -379,8 +379,9 @@ async function sendMessage() {
     const sess = getCurrentSessionRecord();
     if (!sess || sess.messages.length === 0) {
         let title = text.length > 28 ? text.substring(0, 28) + "..." : text;
-        if (/cust\w+/i.test(text)) {
-            title = "KYC: " + text.match(/cust\w+/i)[0];
+        const custMatchTitle = text.match(/\bcust(?!(?:omer|omers|om|oms|omize)\b)[a-z0-9_]+\b/i);
+        if (custMatchTitle) {
+            title = "KYC: " + custMatchTitle[0];
         }
         currentSessionTitle = title;
     }
@@ -416,7 +417,7 @@ async function sendMessage() {
         }
 
         if (data.orchestration_command) {
-            await handleOrchestration(data.orchestration_command, text);
+            await handleOrchestration(data.orchestration_command, text, data);
             return;
         }
 
@@ -443,11 +444,11 @@ async function sendMessage() {
 }
 
 // ── Backend Orchestration Handler (KYC & Underwriting) ──
-async function handleOrchestration(cmd, user_text) {
+async function handleOrchestration(cmd, user_text, chatData = null) {
     const step = cmd.replace("[[FLASK_CALL:", "").replace("]]", "");
 
     if (step === "VERIFY_KYC") {
-        const customer_id = (user_text.match(/cust[\w\d]+/i) || [""])[0];
+        const customer_id = (user_text.match(/\bcust(?!(?:omer|omers|om|oms|omize)\b)[a-z0-9_]+\b/i) || [""])[0];
 
         addTyping();
         try {
@@ -491,10 +492,18 @@ async function handleOrchestration(cmd, user_text) {
         }
     }
 
-// ── Flexible Loan Amount & Tenure Parser ──
+// ── Flexible Loan Amount & Tenure Parser (Client Mirror with Question/Context Safeguards) ──
 function extractLoanAmount(text) {
     if (!text) return null;
-    const clean = text.toString().toLowerCase().replace(/,/g, "").replace(/₹/g, "").replace(/rs\.?/g, "").trim();
+    const rawStr = text.toString().trim();
+    if (/^\s*(?:why|what|how|when|where|which|who|explain|tell me)\b|\?\s*$/i.test(rawStr)) {
+        return null;
+    }
+    // Remove tenure phrase before parsing loan amount
+    const withoutTenure = rawStr
+        .replace(/\b(?:for\s+)?\d+\s*(?:years?|yrs?|months?|mos?)\b/gi, " ")
+        .replace(/\btenure\s*(?:of|is|:)?\s*\d+\b/gi, " ");
+    const clean = withoutTenure.toLowerCase().replace(/,/g, "").replace(/₹/g, "").replace(/rs\.?/g, "").trim();
 
     // Match Lakhs: 5 lakh, 5.5 lakhs, 5 lac
     const lakhMatch = clean.match(/(\d+(?:\.\d+)?)\s*(?:lakhs|lakh|lacs|lac|l)\b/);
@@ -514,17 +523,6 @@ function extractLoanAmount(text) {
         return parseInt(numMatch[0], 10);
     }
 
-    // Match 3 digit number (e.g. 500)
-    const num3Match = clean.match(/\b\d{3}\b/);
-    if (num3Match) {
-        return parseInt(num3Match[0], 10);
-    }
-
-    // Fallback to any digits
-    const anyMatch = clean.match(/\d+/);
-    if (anyMatch) {
-        return parseInt(anyMatch[0], 10);
-    }
     return null;
 }
 
@@ -548,12 +546,16 @@ function extractTenure(text) {
 }
 
     if (step === "UNDERWRITE") {
-        let amt = extractLoanAmount(user_text);
-        let tenure = extractTenure(user_text);
+        let amt = (chatData && chatData.loan_amount) ? chatData.loan_amount : extractLoanAmount(user_text);
+        let tenure = (chatData && chatData.tenure) ? chatData.tenure : extractTenure(user_text);
         if (!amt) {
-            const rawPrompt = prompt("Please enter the requested loan amount:");
+            const rawPrompt = prompt("Please enter the requested loan amount (minimum ₹1,000, e.g. 500000 or 5 lakhs):");
             amt = extractLoanAmount(rawPrompt);
             if (!tenure) tenure = extractTenure(rawPrompt);
+            if (!amt) {
+                addMessage("Loan application cancelled or invalid amount provided. Please enter a clear amount (e.g. `500000` or `5 lakhs`).", "assistant");
+                return;
+            }
         }
 
         addTyping();

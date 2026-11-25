@@ -1059,6 +1059,351 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
             finally:
                 main_app.monitoring_store = orig_store
 
+    # ────────────────────────────────────────────────────────────────
+    # 11. Conversational Routing & Data Integrity Regression Tests
+    # ────────────────────────────────────────────────────────────────
+    def _advance_onboarding_to_cibil(self, sess_id, phone="9811223344", age_city="23, Delhi", name="Aarav Verma"):
+        """Helper to step a fresh session strictly to ASK_CREDIT_SCORE."""
+        main_app.session_data.pop(sess_id, None)
+        main_app.session_histories.pop(sess_id, None)
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": "I am a new customer"})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": name})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": phone})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": "aarav@example.com"})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": age_city})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": "ABCDE1234F"})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": "60000"})
+        self.client.post("/chat", json={"session_id": sess_id, "user_input": "0"})
+
+    def test_55_why_more_than_700_during_cibil_onboarding_uses_gemini_and_preserves_state(self):
+        """Scenario 1: 'Why do I need more than 700?' during CIBIL onboarding goes to Gemini & does NOT complete registration."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="A CIBIL score of 700 or above indicates stronger repayment history and lower credit risk under this demo project's threshold.",
+                    usage_metadata={"input_tokens": 180, "output_tokens": 30, "total_tokens": 210},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                sess_id = "sess_bug1_cibil_q"
+                self._advance_onboarding_to_cibil(sess_id, phone="9811220001")
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+
+                resp = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "Why do I need more than 700?",
+                })
+                data = resp.get_json()
+                reply = data["response_text"]
+
+                self.assertIsNone(data.get("orchestration_command"))
+                self.assertNotIn("Registration Completed Successfully", reply)
+                self.assertIn("repayment history", reply.lower())
+                self.assertIn("cibil", reply.lower())
+                # Pending onboarding state must remain unchanged
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+                self.assertNotIn("credit_score", main_app.session_data[sess_id]["onboarding_data"])
+                mock_llm.invoke.assert_called_once()
+                # Verify SystemMessage only appears at index 0 (langchain-google-genai constraint)
+                passed_msgs = mock_llm.invoke.call_args[0][0]
+                self.assertIsInstance(passed_msgs[0], main_app.SystemMessage)
+                for idx, msg in enumerate(passed_msgs[1:], start=1):
+                    self.assertNotIsInstance(msg, main_app.SystemMessage, f"Unexpected SystemMessage at pos {idx}")
+                self.assertEqual(data["monitoring"]["session"]["breakdown"]["gemini_primary"], 1)
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_56_invalid_cibil_200_then_general_question_never_substitutes_default(self):
+        """Scenario 2 & 3: Invalid CIBIL 200 and 400 stay rejected without substituting 700/750; question preserves state."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="FOIR stands for Fixed Obligation to Income Ratio, capped at 50% in our demonstration rules.",
+                    usage_metadata={"input_tokens": 120, "output_tokens": 22, "total_tokens": 142},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                sess_id = "sess_bug2_cibil_200_400"
+                # Verify invalid age 89 is rejected before accepting 23, Delhi
+                main_app.session_data.pop(sess_id, None)
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "I am a new customer"})
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "Rohan Kapoor"})
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "9811220002"})
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "rohan@example.com"})
+                r_age_bad = self.client.post("/chat", json={"session_id": sess_id, "user_input": "89, Delhi"}).get_json()
+                self.assertIn("maximum eligible age", r_age_bad["response_text"].lower())
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_AGE_CITY")
+                r_age_ok = self.client.post("/chat", json={"session_id": sess_id, "user_input": "23, Delhi"}).get_json()
+                self.assertIn("PAN", r_age_ok["response_text"])
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_data"]["age"], 23)
+
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "ABCDE1234F"})
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "60000"})
+                self.client.post("/chat", json={"session_id": sess_id, "user_input": "0"})
+
+                # Enter 200 -> rejected, onboarding still ASK_CREDIT_SCORE, no score saved
+                r_200 = self.client.post("/chat", json={"session_id": sess_id, "user_input": "200"}).get_json()
+                self.assertIn("200", r_200["response_text"])
+                self.assertNotIn("Registration Completed", r_200["response_text"])
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+                self.assertNotIn("credit_score", main_app.session_data[sess_id]["onboarding_data"])
+
+                # Ask general question during CIBIL prompt -> Gemini answers, onboarding remains ASK_CREDIT_SCORE
+                r_q = self.client.post("/chat", json={"session_id": sess_id, "user_input": "What is FOIR?"}).get_json()
+                self.assertIn("Fixed Obligation to Income Ratio", r_q["response_text"])
+                self.assertNotIn("Registration Completed", r_q["response_text"])
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+
+                # Enter 400 -> rejected, onboarding remains incomplete
+                r_400 = self.client.post("/chat", json={"session_id": sess_id, "user_input": "400"}).get_json()
+                self.assertIn("400", r_400["response_text"])
+                self.assertNotIn("Registration Completed", r_400["response_text"])
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+                self.assertNotIn("credit_score", main_app.session_data[sess_id]["onboarding_data"])
+
+                # Try 'skip' -> rejected without default 750/700
+                r_skip = self.client.post("/chat", json={"session_id": sess_id, "user_input": "skip"}).get_json()
+                self.assertNotIn("Registration Completed", r_skip["response_text"])
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_57_valid_cibil_completes_with_exact_entered_score(self):
+        """Scenario 4: Valid CIBIL completes onboarding recording the exact score (e.g. 785)."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            test_phone = "9811220003"
+            expected_cid = f"cust{test_phone}"
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                self._advance_onboarding_to_cibil("sess_exact_cibil", phone=test_phone)
+
+                resp = self.client.post("/chat", json={"session_id": "sess_exact_cibil", "user_input": "785"}).get_json()
+                reply = resp["response_text"]
+                self.assertIn("Registration Completed Successfully", reply)
+                self.assertIn("785", reply)
+                self.assertEqual(main_app.session_data["sess_exact_cibil"]["credit_score"], 785)
+                self.assertIsNone(main_app.session_data["sess_exact_cibil"].get("onboarding_state"))
+            finally:
+                main_app.monitoring_store = orig_store
+                if os.path.exists("customers.json"):
+                    try:
+                        with open("customers.json", "r") as f:
+                            cdata = json.load(f)
+                        if expected_cid in cdata:
+                            del cdata[expected_cid]
+                            with open("customers.json", "w") as f:
+                                json.dump(cdata, f, indent=2)
+                    except Exception:
+                        pass
+
+    def test_58_question_with_number_700_when_verified_never_triggers_underwriting(self):
+        """Scenario 5 & 6: Verified customer asking question with 700 or minimum loan amount does NOT trigger underwriting."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="A score of 700 helps demonstrate consistent repayment history.",
+                    usage_metadata={"input_tokens": 90, "output_tokens": 15, "total_tokens": 105},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                sess_id = "sess_verified_no_false_underwrite"
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust01"},
+                })
+
+                # Question containing 700
+                r_q700 = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "Why do I need more than 700?",
+                }).get_json()
+                self.assertIsNone(r_q700.get("orchestration_command"))
+                self.assertNotIn("Final Approved", r_q700["response_text"])
+                self.assertIn("700", r_q700["response_text"])
+
+                # Question asking minimum loan amount
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="There is no rigid minimum floor above ₹0 in the demo engine, subject to 15x salary and 50% FOIR.",
+                    usage_metadata={"input_tokens": 95, "output_tokens": 20, "total_tokens": 115},
+                    response_metadata={},
+                )
+                r_min = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "What is the minimum loan amount?",
+                }).get_json()
+                self.assertIsNone(r_min.get("orchestration_command"))
+                self.assertNotIn("Final Approved", r_min["response_text"])
+
+                # Bare ambiguous number 700 (like a CIBIL score) asks clarification instead of approving ₹700
+                r_bare_700 = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "700",
+                }).get_json()
+                self.assertIsNone(r_bare_700.get("orchestration_command"))
+                self.assertIn("ambiguous", r_bare_700["response_text"].lower())
+                self.assertIn("specify", r_bare_700["response_text"].lower())
+
+                # Asking about customer ID format does not falsely match 'customer' as a KYC ID
+                r_cust_word = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "How do I find my customer ID?",
+                }).get_json()
+                self.assertIsNone(r_cust_word.get("orchestration_command"))
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_59_explicit_5_lakh_loan_request_extracts_exact_amount(self):
+        """Scenario 7: Explicit request for ₹5,00,000 triggers UNDERWRITE with exact amount 500000."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                sess_id = "sess_explicit_5lakh"
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust01"},
+                })
+
+                resp = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "I want to apply for a loan of ₹5,00,000",
+                }).get_json()
+                self.assertEqual(resp.get("orchestration_command"), "[[FLASK_CALL:UNDERWRITE]]")
+                self.assertEqual(resp.get("loan_amount"), 500000.0)
+            finally:
+                main_app.monitoring_store = orig_store
+
+    def test_60_gemini_failure_local_fallback_preserves_onboarding_and_does_not_fabricate(self):
+        """Scenario 8 & 9: If Gemini errors mid-onboarding, safe fallback answers without completing onboarding or losing step."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.side_effect = RuntimeError("503 Service Unavailable")
+                main_app.llm = mock_llm
+
+                sess_id = "sess_gemini_fail_onboarding"
+                self._advance_onboarding_to_cibil(sess_id, phone="9811220004")
+
+                r_fail = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "Why do I need more than 700?",
+                }).get_json()
+
+                reply = r_fail["response_text"]
+                self.assertIsNone(r_fail.get("orchestration_command"))
+                self.assertNotIn("Registration Completed", reply)
+                self.assertIn("repayment history", reply.lower())
+                self.assertEqual(main_app.session_data[sess_id]["onboarding_state"], "ASK_CREDIT_SCORE")
+                self.assertNotIn("credit_score", main_app.session_data[sess_id]["onboarding_data"])
+                self.assertEqual(r_fail["monitoring"]["engine_status"]["local_fallback_status"], "ACTIVE")
+                self.assertEqual(r_fail["monitoring"]["session"]["breakdown"]["local_error_fallback"], 1)
+
+                # Test general interruption at ASK_PAN preserves pending step cleanly too
+                sess_pan = "sess_pan_interrupt"
+                main_app.session_data.pop(sess_pan, None)
+                self.client.post("/chat", json={"session_id": sess_pan, "user_input": "I am a new customer"})
+                self.client.post("/chat", json={"session_id": sess_pan, "user_input": "Meera Nair"})
+                self.client.post("/chat", json={"session_id": sess_pan, "user_input": "9811220005"})
+                self.client.post("/chat", json={"session_id": sess_pan, "user_input": "meera@example.com"})
+                self.client.post("/chat", json={"session_id": sess_pan, "user_input": "27, Pune"})
+                self.assertEqual(main_app.session_data[sess_pan]["onboarding_state"], "ASK_PAN")
+
+                r_pan_q = self.client.post("/chat", json={
+                    "session_id": sess_pan,
+                    "user_input": "What happens after registration?",
+                }).get_json()
+                self.assertEqual(main_app.session_data[sess_pan]["onboarding_state"], "ASK_PAN")
+                self.assertEqual(main_app.session_data[sess_pan]["onboarding_data"]["age"], 27)
+                self.assertEqual(main_app.session_data[sess_pan]["onboarding_data"]["city"], "Pune")
+                self.assertIn("PAN", r_pan_q["response_text"])
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_61_previous_assistant_numbers_never_trigger_underwriting_or_llm_command_injection(self):
+        """Scenario 10: Prior assistant numbers & hallucinated LLM [[FLASK_CALL:...]] never trigger underwriting."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                sess_id = "sess_prev_nums"
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust01"},
+                })
+                # Simulate prior assistant message containing lots of numbers in chat history
+                hist = main_app.get_session_history(sess_id)
+                hist.append(main_app.AIMessage(content="Preliminary Loan Eligibility: Up to ₹12,00,000. Minimum score 700. Sample EMI ₹11,122."))
+
+                # Mock Gemini returning a hallucinated command token from stale context
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="FOIR caps monthly EMIs at 50% of salary.\n[[FLASK_CALL:UNDERWRITE]]",
+                    usage_metadata={"input_tokens": 110, "output_tokens": 18, "total_tokens": 128},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                r = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "Thanks! Can you explain FOIR in short?",
+                }).get_json()
+                self.assertIsNone(r.get("orchestration_command"))
+                self.assertNotIn("FLASK_CALL", r["response_text"])
+                self.assertIn("FOIR", r["response_text"])
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
 
 if __name__ == "__main__":
     unittest.main()
