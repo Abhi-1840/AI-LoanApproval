@@ -1823,6 +1823,78 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
             finally:
                 main_app.monitoring_store = orig_store
 
+    def test_72_serverless_session_restores_across_memory_reset(self):
+        """Verified KYC state persists across cleared in-memory session_data via signed session cookie."""
+        sess_id = "sess_serverless_persist"
+        try:
+            kyc_resp = self.client.post("/orchestrate", json={
+                "step": "VERIFY_KYC",
+                "session_id": sess_id,
+                "customer_info": {"customer_id": "cust01"},
+            })
+            self.assertEqual(kyc_resp.status_code, 200)
+            self.assertEqual(kyc_resp.get_json()["status"], "success")
+
+            # Simulate serverless cold start / lambda instance hop by wiping in-memory dict
+            main_app.session_data.clear()
+
+            dash = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+            self.assertTrue(dash["verified"])
+            self.assertEqual(dash["customer"]["customer_id"], "cust01")
+
+            # Also verify UNDERWRITE succeeds after memory reset
+            main_app.session_data.clear()
+            uw = self.client.post("/orchestrate", json={
+                "step": "UNDERWRITE",
+                "session_id": sess_id,
+                "customer_info": {"loan_amount": 500000, "tenure": 60},
+            }).get_json()
+            self.assertEqual(uw["status"], "complete")
+            self.assertIn("Final Approved", uw["worker_message"])
+            self.assertTrue(uw.get("pdf_file"))
+
+            # Logout clears persisted cookie & memory cleanly
+            self.client.post("/chat", json={"session_id": sess_id, "user_input": "logout"})
+            main_app.session_data.clear()
+            dash_after = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+            self.assertFalse(dash_after["verified"])
+        finally:
+            main_app.session_data.pop(sess_id, None)
+
+    def test_73_integrated_admin_panel_and_sanction_pdf_serving(self):
+        """Integrated /admin, /add-customer, /sanctions/<pdf>, and /health work on main Flask app."""
+        admin_page = self.client.get("/admin")
+        self.assertEqual(admin_page.status_code, 200)
+        self.assertIn(b"ADMIN PANEL", admin_page.data)
+        self.assertIn(b"Open Chatbot", admin_page.data)
+
+        health = self.client.get("/health").get_json()
+        self.assertEqual(health["status"], "ok")
+        self.assertIn("serverless_mode", health)
+        self.assertIn("writable_data_dir", health)
+
+        # Verify sanction PDF generated on UNDERWRITE is downloadable via /sanctions/<filename>
+        sess_id = "sess_pdf_dl"
+        try:
+            self.client.post("/orchestrate", json={
+                "step": "VERIFY_KYC",
+                "session_id": sess_id,
+                "customer_info": {"customer_id": "cust01"},
+            })
+            uw = self.client.post("/orchestrate", json={
+                "step": "UNDERWRITE",
+                "session_id": sess_id,
+                "customer_info": {"loan_amount": 300000, "tenure": 48},
+            }).get_json()
+            pdf_name = uw.get("pdf_file")
+            self.assertTrue(pdf_name)
+            pdf_resp = self.client.get(f"/sanctions/{pdf_name}")
+            self.assertEqual(pdf_resp.status_code, 200)
+            self.assertTrue(pdf_resp.data.startswith(b"%PDF"))
+            pdf_resp.close()
+        finally:
+            main_app.session_data.pop(sess_id, None)
+
 
 if __name__ == "__main__":
     unittest.main()

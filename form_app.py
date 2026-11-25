@@ -26,8 +26,8 @@ if os.path.exists(CONFIG_PATH):
 else:
     print("[WARNING] config.json not found. Firebase saving will be disabled.")
 
-FIREBASE_DB_URL = config.get("firebase_database_url", "").rstrip("/")
-FIREBASE_API_KEY = config.get("firebase_api_key", "")
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DATABASE_URL", config.get("firebase_database_url", "")).rstrip("/")
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", config.get("firebase_api_key", ""))
 
 
 def calculate_age_from_dob(dob_input):
@@ -132,7 +132,7 @@ def validate_customer_eligibility(name, phone, age, salary, credit, currentloan=
 
 @app.route("/")
 def form():
-    return render_template("form.html")
+    return render_template("form.html", chatbot_url="http://localhost:5000", chatbot_label="Open Chatbot :5000")
 
 
 @app.route("/add-customer", methods=["POST"])
@@ -161,7 +161,12 @@ def add_customer():
     )
 
     if errors:
-        return render_template("form.html", error="<br>• " + "<br>• ".join(errors))
+        return render_template(
+            "form.html",
+            error="<br>• " + "<br>• ".join(errors),
+            chatbot_url="http://localhost:5000",
+            chatbot_label="Open Chatbot :5000",
+        )
 
     customer_id = f"cust{phone}"
     salary_int = int(float(salary))
@@ -239,7 +244,9 @@ def add_customer():
         success=True,
         customer_id=customer_id,
         firebase_saved=firebase_saved,
-        firebase_error=firebase_error
+        firebase_error=firebase_error,
+        chatbot_url="http://localhost:5000",
+        chatbot_label="Open Chatbot :5000",
     )
 
 

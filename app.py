@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+import hashlib
+import tempfile
 import smtplib
 import requests
 import io
@@ -12,7 +14,7 @@ from email.message import EmailMessage
 # Suppress cosmetic dependency mismatch warning for clean terminal logs
 warnings.filterwarnings("ignore", message=r".*urllib3.*or chardet.*doesn't match a supported version!.*")
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, session, send_from_directory, has_request_context
 from flask_cors import CORS
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -88,8 +90,50 @@ if API_KEY:
     os.environ["GOOGLE_GENAI_API_KEY"] = API_KEY
     os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
 
+IS_SERVERLESS = bool(
+    os.environ.get("VERCEL")
+    or os.environ.get("VERCEL_ENV")
+    or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+)
+
+
+def _use_temp_storage():
+    if IS_SERVERLESS:
+        return True
+    try:
+        return not os.access(".", os.W_OK)
+    except Exception:
+        return True
+
+
+USE_TEMP_STORAGE = _use_temp_storage()
+WRITABLE_DATA_DIR = tempfile.gettempdir() if USE_TEMP_STORAGE else "."
+BUNDLED_CUSTOMERS_FILE = "customers.json"
+RUNTIME_CUSTOMERS_FILE = (
+    BUNDLED_CUSTOMERS_FILE
+    if WRITABLE_DATA_DIR == "."
+    else os.path.join(WRITABLE_DATA_DIR, "customers.json")
+)
+SANCTIONS_DIR = (
+    "sanctions"
+    if WRITABLE_DATA_DIR == "."
+    else os.path.join(WRITABLE_DATA_DIR, "sanctions")
+)
+os.makedirs(SANCTIONS_DIR, exist_ok=True)
+DEFAULT_MONITORING_STATS_PATH = (
+    "monitoring_stats.json"
+    if WRITABLE_DATA_DIR == "."
+    else os.path.join(WRITABLE_DATA_DIR, "monitoring_stats.json")
+)
+
 app = Flask(__name__, static_folder="static", static_url_path="/static", template_folder="templates")
 CORS(app)
+_secret_seed = os.environ.get("FLASK_SECRET_KEY") or API_KEY or "loanai-local-dev-session-secret"
+app.secret_key = hashlib.sha256(_secret_seed.encode("utf-8")).hexdigest()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 session_histories = {}
 session_data = {}
@@ -136,7 +180,7 @@ else:
     print("[INFO] No Gemini API key set. Running in local fallback mode.")
 
 monitoring_store = AIMonitoringStore(
-    local_path=os.environ.get("MONITORING_STATS_PATH", "monitoring_stats.json"),
+    local_path=os.environ.get("MONITORING_STATS_PATH", DEFAULT_MONITORING_STATS_PATH),
     firebase_db_url=FIREBASE_DB_URL,
     firebase_api_key=FIREBASE_API_KEY,
     configured_model=MODEL_NAME,
@@ -193,6 +237,149 @@ def save_session_meta(session_id, meta):
     except Exception:
         pass
 
+
+def _build_compact_session_snapshot(session_id):
+    """Build compact JSON-serializable state snapshot for serverless persistence."""
+    sess = session_data.get(session_id)
+    if not isinstance(sess, dict) or not session_id:
+        return None
+    if sess.get("customer_id") and (sess.get("verified") or sess.get("status") == "Verification Successful"):
+        snap = {
+            "session_id": session_id,
+            "customer_id": str(sess["customer_id"]).lower().strip(),
+            "verified": True,
+        }
+        for k in (
+            "verified_at",
+            "last_requested_amount",
+            "last_requested_tenure",
+            "last_underwriting_result",
+            "sanction",
+        ):
+            if sess.get(k) is not None:
+                snap[k] = sess.get(k)
+        return snap
+    if sess.get("onboarding_state"):
+        return {
+            "session_id": session_id,
+            "onboarding_state": sess.get("onboarding_state"),
+            "onboarding_data": sess.get("onboarding_data") or {},
+        }
+    return None
+
+
+def persist_session_state(session_id):
+    """Persist verified KYC or active onboarding state to Firebase RTDB + signed Flask cookie."""
+    if not session_id:
+        return
+    snap = _build_compact_session_snapshot(session_id)
+    if has_request_context():
+        try:
+            if snap:
+                session["loanai_state"] = snap
+                session.modified = True
+            else:
+                session.pop("loanai_state", None)
+        except Exception:
+            pass
+
+    if FIREBASE_DB_URL:
+        try:
+            url = f"{FIREBASE_DB_URL}/sessions/{session_id}/runtime_state.json"
+            if FIREBASE_API_KEY:
+                url += f"?auth={FIREBASE_API_KEY}"
+            if snap:
+                requests.put(url, json=snap, timeout=2)
+            else:
+                requests.delete(url, timeout=2)
+        except Exception:
+            pass
+
+
+def clear_persisted_session_state(session_id):
+    """Clear session state in memory, signed cookie, and Firebase RTDB."""
+    session_data[session_id] = {}
+    if has_request_context():
+        try:
+            session.pop("loanai_state", None)
+        except Exception:
+            pass
+    if FIREBASE_DB_URL and session_id:
+        try:
+            url = f"{FIREBASE_DB_URL}/sessions/{session_id}/runtime_state.json"
+            if FIREBASE_API_KEY:
+                url += f"?auth={FIREBASE_API_KEY}"
+            requests.delete(url, timeout=2)
+        except Exception:
+            pass
+
+
+def restore_session_state(session_id):
+    """
+    Restore verified customer or onboarding state when running across serverless instances.
+    Re-hydrates verified customer profiles authoritatively via verify_kyc() to prevent tampering.
+    """
+    if not session_id:
+        return None
+    existing = session_data.get(session_id)
+    if isinstance(existing, dict) and (
+        existing.get("customer_id") or existing.get("onboarding_state")
+    ):
+        return existing
+
+    snap = None
+    if FIREBASE_DB_URL:
+        try:
+            url = f"{FIREBASE_DB_URL}/sessions/{session_id}/runtime_state.json"
+            if FIREBASE_API_KEY:
+                url += f"?auth={FIREBASE_API_KEY}"
+            resp = requests.get(url, timeout=2)
+            if resp.status_code == 200:
+                candidate = resp.json()
+                if isinstance(candidate, dict) and candidate.get("session_id") == session_id:
+                    snap = candidate
+        except Exception:
+            snap = None
+
+    if not snap and has_request_context():
+        try:
+            cookie_state = session.get("loanai_state")
+            if isinstance(cookie_state, dict) and cookie_state.get("session_id") == session_id:
+                snap = cookie_state
+        except Exception:
+            snap = None
+
+    if not isinstance(snap, dict):
+        return existing
+
+    cid = snap.get("customer_id")
+    if cid and snap.get("verified"):
+        cust = verify_kyc(cid)
+        if cust.get("status") == "Verification Successful":
+            cust["verified"] = True
+            for k in (
+                "verified_at",
+                "last_requested_amount",
+                "last_requested_tenure",
+                "last_underwriting_result",
+                "sanction",
+            ):
+                if snap.get(k) is not None:
+                    cust[k] = snap[k]
+            cust["profile_assessment"] = evaluate_customer_profile_eligibility(cust)
+            session_data[session_id] = cust
+            return cust
+
+    if snap.get("onboarding_state"):
+        restored = {
+            "onboarding_state": snap.get("onboarding_state"),
+            "onboarding_data": snap.get("onboarding_data") or {},
+        }
+        session_data[session_id] = restored
+        return restored
+
+    return existing
+
 def get_customer_from_firebase(customer_id):
     if not FIREBASE_DB_URL:
         return None
@@ -233,20 +420,23 @@ def verify_kyc(customer_id):
         c["status"] = "Verification Successful"
         return c
 
-    # 2. Check local customers.json (saved from Admin Panel)
-    local_file = "customers.json"
-    if os.path.exists(local_file):
-        try:
-            with open(local_file, "r") as f:
-                saved = json.load(f)
-            # Check exact or lowercase key
-            match = saved.get(cid) or saved.get(customer_id)
-            if match:
-                res = match.copy()
-                res["status"] = "Verification Successful"
-                return res
-        except Exception:
-            pass
+    # 2. Check runtime writable customers.json, then bundled customers.json
+    candidate_files = [RUNTIME_CUSTOMERS_FILE]
+    if BUNDLED_CUSTOMERS_FILE != RUNTIME_CUSTOMERS_FILE:
+        candidate_files.append(BUNDLED_CUSTOMERS_FILE)
+
+    for local_file in candidate_files:
+        if os.path.exists(local_file):
+            try:
+                with open(local_file, "r") as f:
+                    saved = json.load(f)
+                match = saved.get(cid) or saved.get(customer_id)
+                if match:
+                    res = match.copy()
+                    res["status"] = "Verification Successful"
+                    return res
+            except Exception:
+                pass
 
     # 3. Check built-in dummy customers
     dummy = DUMMY_CUSTOMERS.get(cid)
@@ -412,21 +602,25 @@ def calculate_emi(principal, rate, months):
     return (principal * r * (1 + r) ** months) / ((1 + r) ** months - 1)
 
 def save_customer_to_storage(customer_data):
-    """Save customer to customers.json and Firebase (if configured)."""
+    """Save customer to writable customers.json and Firebase (if configured)."""
     customer_id = customer_data["customer_id"].lower().strip()
 
-    # 1. Save to local customers.json
-    local_file = "customers.json"
+    # 1. Save to writable customers.json (seeded from bundled customers.json on serverless)
+    local_file = RUNTIME_CUSTOMERS_FILE
     customers = {}
-    if os.path.exists(local_file):
+    seed_file = local_file if os.path.exists(local_file) else BUNDLED_CUSTOMERS_FILE
+    if os.path.exists(seed_file):
         try:
-            with open(local_file, "r") as f:
+            with open(seed_file, "r") as f:
                 customers = json.load(f)
         except Exception:
             customers = {}
 
     customers[customer_id] = customer_data
     try:
+        parent = os.path.dirname(os.path.abspath(local_file))
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
         with open(local_file, "w") as f:
             json.dump(customers, f, indent=2)
         print(f"[INFO] Customer {customer_id} saved locally in {local_file}")
@@ -607,8 +801,6 @@ def underwrite(customer, loan_amount, tenure=None):
     }
 
 # ── PDF Generation ──
-
-SANCTIONS_DIR = "sanctions"
 os.makedirs(SANCTIONS_DIR, exist_ok=True)
 
 def generate_sanction_letter_pdf(customer_input, loan_amount, tenure):
@@ -1493,9 +1685,10 @@ def simulate_loan_for_verified_customer(session_id, loan_amount, tenure_months=N
 def get_verified_customer_context(session_id, refresh_from_firebase=True):
     """
     Retrieve the session-bound verified customer record and deterministic eligibility summary.
-    Refreshes from Firebase RTDB when configured so Firebase remains the source of truth.
+    Restores across serverless invocations if needed and refreshes from Firebase RTDB when configured.
     Returns (customer_dict, assessment_dict) or (None, None) if session is unverified.
     """
+    restore_session_state(session_id)
     sess = session_data.get(session_id)
     if not isinstance(sess, dict):
         return None, None
@@ -1742,6 +1935,7 @@ def local_master_agent(session_id, text):
     - Uses safe_local_informational_fallback() only when Gemini is unavailable/errors, without mutating state
     """
     t = text.lower().strip()
+    restore_session_state(session_id)
     sess = session_data.setdefault(session_id, {})
     onboarding_state = sess.get("onboarding_state")
 
@@ -2056,7 +2250,7 @@ def local_master_agent(session_id, text):
 
     # ── 4. LOGOUT / SWITCH CUSTOMER ──
     if is_logout_phrase(text):
-        session_data[session_id] = {}
+        clear_persisted_session_state(session_id)
         session_histories[session_id] = [SystemMessage(content=LLM_SYSTEM_PROMPT)]
         return (
             "✅ **Logged out successfully.** Your verified customer context has been cleared.\n\n"
@@ -2231,6 +2425,7 @@ def chat():
     hist = get_session_history(session_id)
     hist.append(HumanMessage(content=user_input))
 
+    restore_session_state(session_id)
     sess = session_data.setdefault(session_id, {})
     onboarding_state = sess.get("onboarding_state")
     t_lower = user_input.lower().strip()
@@ -2349,6 +2544,8 @@ def chat():
         # If an FAQ/EMI interrupted onboarding, remind the pending step cleanly while preserving state
         if onboarding_state and (is_structured_faq or is_emi_query) and sess.get("onboarding_state"):
             text = append_onboarding_reminder(text, sess["onboarding_state"])
+        if not is_logout:
+            persist_session_state(session_id)
         engine_category = "local_rules"
         model_used = "local_master_agent"
     elif not llm:
@@ -2517,6 +2714,7 @@ def orchestrate():
             assessment = evaluate_customer_profile_eligibility(c)
             c["profile_assessment"] = assessment
             session_data[session_id] = c.copy()
+            persist_session_state(session_id)
             save_session_meta(session_id, {"customer_name": c["name"], "email": c.get("email")})
 
             # Record concise verification summary in conversation history for continuity
@@ -2537,6 +2735,7 @@ def orchestrate():
         return jsonify({"status": "error", "message": c.get("message", "Verification failed"), "next_step": "AWAITING_KYC"})
 
     if step == "UNDERWRITE":
+        restore_session_state(session_id)
         c = session_data.get(session_id)
         if not c or not c.get("customer_id"):
             return jsonify({"status": "error", "message": "No verified customer found. Please verify KYC first."})
@@ -2600,8 +2799,12 @@ def orchestrate():
 
             if email_ok:
                 email_message = f"✅ Sanction letter sent to {email}"
-            else:
+            elif fpdf_path:
                 email_message = f"⚠️ PDF generated but email could not be sent ({email_err}). PDF saved locally."
+            else:
+                email_message = f"⚠️ Loan approved, but PDF generation failed ({email_err})."
+
+            persist_session_state(session_id)
 
             return jsonify({
                 "status": "complete",
@@ -2612,6 +2815,7 @@ def orchestrate():
                 "pdf_file": os.path.basename(fpdf_path) if fpdf_path else None
             })
 
+        persist_session_state(session_id)
         # Rejection
         return jsonify({
             "status": "complete",
@@ -2628,13 +2832,91 @@ def orchestrate():
 def new_chat():
     session_id = f"sess_{int(time.time())}"
     session_histories[session_id] = [SystemMessage(content=LLM_SYSTEM_PROMPT)]
-    session_data[session_id] = {}
+    clear_persisted_session_state(session_id)
     return jsonify({"session_id": session_id})
 
 
 @app.route("/")
 def index():
     return render_template("chat.html")
+
+
+@app.route("/sanctions/<path:filename>")
+def download_sanction_pdf(filename):
+    """Serve generated sanction letter PDF from writable sanctions directory."""
+    safe_name = os.path.basename(filename)
+    return send_from_directory(SANCTIONS_DIR, safe_name, as_attachment=False)
+
+
+@app.route("/admin", methods=["GET"])
+def admin_panel():
+    """Serve Customer Onboarding & Admin Panel directly under the main app (Vercel-compatible)."""
+    return render_template("form.html", chatbot_url="/", chatbot_label="Open Chatbot")
+
+
+@app.route("/add-customer", methods=["POST"])
+def admin_add_customer():
+    """Validate and save a new customer directly from the integrated Admin Panel."""
+    from form_app import validate_customer_eligibility
+
+    name = request.form.get("customerName", "").strip()
+    phone = request.form.get("phoneNumber", "").strip()
+    dob = request.form.get("dob", "").strip()
+    age = request.form.get("age", "").strip()
+    city = request.form.get("city", "").strip()
+    pan = request.form.get("panNumber", "").strip().upper()
+    email = request.form.get("emailAddress", "").strip()
+    salary = request.form.get("salary", "").strip()
+    currentloan = request.form.get("currentLoan", "0").strip()
+    credit = request.form.get("creditScore", "").strip()
+
+    errors, final_age = validate_customer_eligibility(
+        name=name,
+        phone=phone,
+        age=age,
+        salary=salary,
+        credit=credit,
+        currentloan=currentloan,
+        dob=dob,
+    )
+    if errors:
+        return render_template(
+            "form.html",
+            error="<br>• " + "<br>• ".join(errors),
+            chatbot_url="/",
+            chatbot_label="Open Chatbot",
+        )
+
+    customer_id = f"cust{phone}"
+    salary_int = int(float(salary))
+    credit_int = int(credit)
+    currentloan_int = int(float(currentloan)) if currentloan else 0
+    new_customer = {
+        "customer_id": customer_id,
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "dob": dob,
+        "age": final_age,
+        "city": city,
+        "pannumber": pan,
+        "salary": salary_int,
+        "credit_score": credit_int,
+        "pre_approved_limit": salary_int * 15,
+        "current_loan_status": str(currentloan_int),
+    }
+    save_customer_to_storage(new_customer)
+    firebase_saved = bool(FIREBASE_DB_URL)
+    firebase_error = "" if firebase_saved else "Firebase not configured. Saved to runtime customers store."
+    return render_template(
+        "form.html",
+        success=True,
+        customer_id=customer_id,
+        firebase_saved=firebase_saved,
+        firebase_error=firebase_error,
+        chatbot_url="/",
+        chatbot_label="Open Chatbot",
+    )
 
 
 @app.route("/api/eligibility-dashboard", methods=["GET"])
@@ -2691,6 +2973,8 @@ def health():
         "persistence_mode": snapshot["engine_status"]["persistence_mode"],
         "firebase_configured": bool(FIREBASE_DB_URL),
         "email_configured": bool(GMAIL_USER and GMAIL_APP_PASSWORD),
+        "serverless_mode": IS_SERVERLESS,
+        "writable_data_dir": WRITABLE_DATA_DIR,
         "dummy_customers": list(DUMMY_CUSTOMERS.keys())
     })
 

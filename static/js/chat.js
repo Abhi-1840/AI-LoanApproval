@@ -604,7 +604,11 @@ function extractTenure(text) {
             }
 
             if (data.email_message) {
-                const cleanEmail = sanitizeMessage(data.email_message);
+                let cleanEmail = sanitizeMessage(data.email_message);
+                if (data.pdf_file) {
+                    const safePdf = encodeURIComponent(data.pdf_file);
+                    cleanEmail += `<br><a href="/sanctions/${safePdf}" target="_blank" class="inline-dashboard-btn" style="margin-top:8px;">View Sanction Letter (PDF) →</a>`;
+                }
                 setTimeout(() => {
                     addMessage(cleanEmail, "assistant", false);
                 }, 350);

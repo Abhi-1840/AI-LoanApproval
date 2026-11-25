@@ -33,11 +33,11 @@
     </div>
 
     <div class="top-controls">
-        <a href="http://localhost:5000" class="nav-pill-btn" title="Open AI Chatbot">
+        <a href="{{ chatbot_url|default('/') }}" class="nav-pill-btn" title="Open AI Chatbot">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
             </svg>
-            <span>Open Chatbot :5000</span>
+            <span>{{ chatbot_label|default('Open Chatbot') }}</span>
         </a>
         <button class="theme-toggle-btn icon-btn" id="formThemeToggle" title="Toggle Light / Dark Mode" aria-label="Toggle Light or Dark Mode">
             <svg class="sun-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -141,7 +141,7 @@
                 <div id="successMessage" class="successMessage show">
                     <h2>✅ Customer Added Successfully!</h2>
                     <p>Customer ID: <strong>{{ customer_id }}</strong></p>
-                    <p>Use this ID in the chatbot at <a href="http://localhost:5000" target="_blank">localhost:5000</a></p>
+                    <p>Use this ID in the <a href="{{ chatbot_url|default('/') }}" target="_blank">AI Loan Chatbot</a></p>
                     {% if firebase_saved %}
                     <p class="save-note">✔ Saved to Firebase cloud database.</p>
                     {% else %}
