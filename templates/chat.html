@@ -133,6 +133,21 @@
 
             <!-- Sidebar Footer -->
             <div class="sidebar-footer">
+                <!-- View My Eligibility Dashboard Action -->
+                <button class="sidebar-elig-btn" id="sidebarEligibilityBtn" type="button" title="Open Personal Loan Eligibility & EMI Dashboard">
+                    <span class="seb-icon">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 20V10"></path>
+                            <path d="M18 20V4"></path>
+                            <path d="M6 20v-4"></path>
+                        </svg>
+                    </span>
+                    <span class="seb-text">
+                        <strong>View My Eligibility Dashboard</strong>
+                        <small id="sidebarEligSub">Verify KYC to unlock personal view</small>
+                    </span>
+                </button>
+
                 <!-- Live AI Engine Quick Status Card -->
                 <button class="sidebar-monitor-card" id="sidebarMonitorBtn" type="button" title="Open AI Engine & Token Usage Dashboard">
                     <div class="smc-header">
@@ -222,6 +237,14 @@
                 </div>
 
                 <div class="header-actions">
+                    <button class="icon-btn action-text-btn elig-trigger-btn" id="openEligibilityBtn" type="button" title="View My Eligibility Dashboard">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 20V10"></path>
+                            <path d="M18 20V4"></path>
+                            <path d="M6 20v-4"></path>
+                        </svg>
+                        <span class="elig-btn-label">Eligibility</span>
+                    </button>
                     <button class="icon-btn action-text-btn monitor-trigger-btn" id="openMonitorBtn" type="button" title="Open AI Engine & Token Telemetry">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
@@ -540,6 +563,263 @@
                 </div>
             </div>
         </aside>
+
+        <!-- Interactive Loan Eligibility Dashboard Modal -->
+        <div class="elig-backdrop" id="eligibilityBackdrop"></div>
+        <section class="elig-modal" id="eligibilityModal" role="dialog" aria-modal="true" aria-labelledby="eligModalTitle" aria-hidden="true">
+            <header class="elig-modal-header">
+                <div class="elig-header-left">
+                    <div class="elig-brand-badge">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                        </svg>
+                        <span>Underwriting Intelligence</span>
+                    </div>
+                    <h2 id="eligModalTitle">Loan Eligibility Dashboard</h2>
+                </div>
+                <div class="elig-header-actions">
+                    <button class="icon-btn" id="refreshEligibilityBtn" type="button" title="Refresh from Backend" aria-label="Refresh Eligibility Dashboard">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                        </svg>
+                    </button>
+                    <button class="icon-btn" id="closeEligibilityBtn" type="button" title="Close Dashboard" aria-label="Close Dashboard">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+            </header>
+
+            <div class="elig-modal-body">
+                <!-- Unverified KYC Empty State -->
+                <div class="elig-kyc-gate" id="eligUnverifiedGate" hidden>
+                    <div class="elig-gate-icon">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                        </svg>
+                    </div>
+                    <h3>KYC Verification Required</h3>
+                    <p id="eligGateMessage">
+                        Please complete KYC verification first by entering your Customer ID (e.g., <code>cust01</code> or <code>cust99</code>) or registering as a new customer in the chat.
+                    </p>
+                    <div class="elig-gate-actions">
+                        <button class="elig-quick-btn primary" id="eligQuickCust01" type="button">Try cust01 (810 Score)</button>
+                        <button class="elig-quick-btn" id="eligQuickCust99" type="button">Try cust99 (580 Score)</button>
+                        <button class="elig-quick-btn" id="eligQuickRegister" type="button">Register in Chat</button>
+                    </div>
+                </div>
+
+                <!-- Verified Customer Dashboard -->
+                <div class="elig-content" id="eligDashboardContent" hidden>
+                    <!-- 1. Customer Overview Strip -->
+                    <div class="elig-profile-banner">
+                        <div class="elig-identity">
+                            <div class="elig-avatar" id="eligAvatarInitial">C</div>
+                            <div>
+                                <div class="elig-name-row">
+                                    <h3 id="eligCustomerName">Customer Name</h3>
+                                    <span class="elig-cid-chip" id="eligCustomerId">cust01</span>
+                                </div>
+                                <div class="elig-app-status" id="eligAppStatus">Preliminary Eligible</div>
+                            </div>
+                        </div>
+                        <div class="elig-verdict-wrap">
+                            <span class="elig-verdict-label">Overall Eligibility</span>
+                            <span class="status-badge preapproved" id="eligOverallBadge">Preliminary Eligible</span>
+                        </div>
+                    </div>
+
+                    <div class="elig-kpi-grid">
+                        <div class="elig-kpi-card">
+                            <span class="ek-label">Monthly Net Salary</span>
+                            <strong class="ek-value" id="eligSalaryVal">₹0</strong>
+                            <span class="ek-sub">Verified income</span>
+                        </div>
+                        <div class="elig-kpi-card highlight">
+                            <span class="ek-label">Preliminary Loan Limit (15×)</span>
+                            <strong class="ek-value" id="eligPrelimLimitVal">₹0</strong>
+                            <span class="ek-sub">Salary-based cap</span>
+                        </div>
+                        <div class="elig-kpi-card">
+                            <span class="ek-label">Verified CIBIL Score</span>
+                            <strong class="ek-value" id="eligCreditVal">—</strong>
+                            <span class="ek-sub">Min required: 700</span>
+                        </div>
+                        <div class="elig-kpi-card">
+                            <span class="ek-label">Existing Monthly EMIs</span>
+                            <strong class="ek-value" id="eligExistingEmiVal">₹0</strong>
+                            <span class="ek-sub" id="eligFreeEmiSub">Free capacity: ₹0/mo</span>
+                        </div>
+                        <div class="elig-kpi-card">
+                            <span class="ek-label">Requested Loan Amount</span>
+                            <strong class="ek-value" id="eligRequestedAmtVal">Not Requested</strong>
+                            <span class="ek-sub" id="eligTenureSub">Band tenure: —</span>
+                        </div>
+                    </div>
+
+                    <!-- 2. Credit Score Gauge + "Why This Result?" -->
+                    <div class="elig-two-col">
+                        <!-- Credit Score Visualization -->
+                        <div class="elig-panel-card">
+                            <div class="epc-head">
+                                <h4>CIBIL / Credit Score Gauge</h4>
+                                <span class="check-pill pending" id="gaugeStatusPill">Pending</span>
+                            </div>
+                            <div class="cibil-gauge-wrap">
+                                <svg class="cibil-gauge-svg" viewBox="0 0 220 130" aria-label="Credit Score Gauge">
+                                    <!-- Background track arc (300 to 900) -->
+                                    <path class="gauge-track" d="M 24 110 A 86 86 0 0 1 196 110" fill="none" stroke-width="14" stroke-linecap="round"></path>
+                                    <!-- Score progress arc -->
+                                    <path class="gauge-fill" id="cibilGaugeFill" d="M 24 110 A 86 86 0 0 1 196 110" fill="none" stroke-width="14" stroke-linecap="round" stroke-dasharray="270.18" stroke-dashoffset="270.18"></path>
+                                    <!-- Configured 700 Minimum Threshold Tick (~66.7% along 300-900 arc: angle = 60 deg from right) -->
+                                    <line class="gauge-threshold-tick" x1="149" y1="31" x2="157" y2="18" stroke-width="2.5" stroke-linecap="round"></line>
+                                    <text class="gauge-threshold-label" x="160" y="16">700 Min</text>
+                                    <text class="gauge-scale-min" x="14" y="126">300</text>
+                                    <text class="gauge-scale-max" x="190" y="126">900</text>
+                                </svg>
+                                <div class="gauge-center-readout">
+                                    <span class="gauge-score-num" id="gaugeScoreNum">—</span>
+                                    <span class="gauge-score-caption">Verified Score</span>
+                                </div>
+                            </div>
+                            <p class="epc-note" id="gaugeExplanation">—</p>
+                        </div>
+
+                        <!-- Explainable Decision ("Why this result?") -->
+                        <div class="elig-panel-card">
+                            <div class="epc-head">
+                                <h4>Why this result?</h4>
+                                <span class="epc-tag">Authoritative Rules</span>
+                            </div>
+                            <div class="why-headline" id="whyHeadline">—</div>
+                            <p class="why-summary" id="whySummary">—</p>
+
+                            <div class="why-buckets">
+                                <div class="why-bucket" id="whyPassedBox" hidden>
+                                    <span class="wb-title passed">Passed</span>
+                                    <ul id="whyPassedList"></ul>
+                                </div>
+                                <div class="why-bucket" id="whyFailedBox" hidden>
+                                    <span class="wb-title failed">Failed</span>
+                                    <ul id="whyFailedList"></ul>
+                                </div>
+                                <div class="why-bucket" id="whyPendingBox" hidden>
+                                    <span class="wb-title pending">Pending Evaluation</span>
+                                    <ul id="whyPendingList"></ul>
+                                </div>
+                            </div>
+
+                            <div class="why-disclaimer" id="whyDisclaimer"></div>
+                        </div>
+                    </div>
+
+                    <!-- 3. Detailed 6-Criterion Underwriting Checklist -->
+                    <div class="elig-panel-card">
+                        <div class="epc-head">
+                            <h4>Underwriting Eligibility Checklist</h4>
+                            <span class="epc-tag">Python Rule Engine</span>
+                        </div>
+                        <div class="elig-checklist-grid" id="eligChecklistGrid"></div>
+                    </div>
+
+                    <!-- 4. Interactive EMI & Loan Simulator -->
+                    <div class="elig-panel-card simulator-card">
+                        <div class="epc-head">
+                            <div>
+                                <h4>Interactive EMI &amp; Loan Simulator</h4>
+                                <p class="sim-subtitle">Explore monthly repayments &amp; FOIR safely — backed by Python's <code>calculate_emi()</code> formula</p>
+                            </div>
+                            <span class="sim-readonly-pill">Simulation Only (Does Not Modify Profile)</span>
+                        </div>
+
+                        <div class="sim-layout">
+                            <div class="sim-controls">
+                                <div class="sim-field">
+                                    <div class="sim-field-top">
+                                        <label for="simAmountInput">Requested Loan Amount (₹)</label>
+                                        <input type="number" id="simAmountInput" class="sim-num-input" min="1000" step="5000" value="300000" />
+                                    </div>
+                                    <input type="range" id="simAmountSlider" class="sim-slider" min="10000" max="2000000" step="10000" value="300000" />
+                                    <div class="sim-range-bounds">
+                                        <span>₹10,000</span>
+                                        <span id="simSliderMaxLabel">₹20,00,000</span>
+                                    </div>
+                                </div>
+
+                                <div class="sim-row-2">
+                                    <div class="sim-field">
+                                        <label>Loan Tenure (Months)</label>
+                                        <div class="tenure-pills" id="simTenureGroup">
+                                            <button type="button" class="tenure-pill" data-tenure="48">48 mo</button>
+                                            <button type="button" class="tenure-pill active" data-tenure="60">60 mo</button>
+                                            <button type="button" class="tenure-pill" data-tenure="72">72 mo</button>
+                                        </div>
+                                    </div>
+
+                                    <div class="sim-field">
+                                        <div class="sim-field-top">
+                                            <label for="simRateInput">Annual Interest Rate (%)</label>
+                                            <button type="button" class="sim-reset-link" id="simResetRateBtn">Reset 12%</button>
+                                        </div>
+                                        <input type="number" id="simRateInput" class="sim-num-input full" min="0" max="50" step="0.1" value="12.0" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="sim-results">
+                                <div class="sim-res-top">
+                                    <div class="sim-emi-hero">
+                                        <span>Estimated Monthly EMI</span>
+                                        <strong id="simMonthlyEmi">₹0</strong>
+                                    </div>
+                                    <span class="status-badge preapproved" id="simAffordBadge">Calculating...</span>
+                                </div>
+
+                                <div class="sim-res-grid">
+                                    <div class="sim-stat">
+                                        <span>Total Interest</span>
+                                        <strong id="simTotalInterest">₹0</strong>
+                                    </div>
+                                    <div class="sim-stat">
+                                        <span>Total Repayment</span>
+                                        <strong id="simTotalRepayment">₹0</strong>
+                                    </div>
+                                    <div class="sim-stat">
+                                        <span>Projected FOIR</span>
+                                        <strong id="simFoirPct">0.0%</strong>
+                                    </div>
+                                </div>
+
+                                <div class="sim-foir-bar-wrap">
+                                    <div class="sim-foir-labels">
+                                        <span>FOIR Capacity Utilization</span>
+                                        <span>50% Max Limit</span>
+                                    </div>
+                                    <div class="sim-foir-track">
+                                        <div class="sim-foir-fill" id="simFoirBar" style="width: 0%"></div>
+                                        <div class="sim-foir-threshold" title="50% FOIR Threshold"></div>
+                                    </div>
+                                </div>
+
+                                <div class="sim-submit-row">
+                                    <button type="button" class="sim-submit-btn" id="simSubmitUnderwriteBtn">
+                                        Submit for Underwriting
+                                    </button>
+                                    <span class="sim-submit-note" id="simSubmitNote">
+                                        Real underwriting runs authoritative Python rules at fixed 12.0% p.a. and generates a sanction letter if approved.
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
     </div>
 
     <script src="/static/js/motion.js"></script>

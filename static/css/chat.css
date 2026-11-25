@@ -2161,6 +2161,934 @@ body.ai-generating .ai-indicator-dot {
     font-weight: 500;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   INTERACTIVE LOAN ELIGIBILITY DASHBOARD MODAL
+   ────────────────────────────────────────────────────────────────────────── */
+.elig-trigger-btn svg {
+    color: var(--color-success);
+}
+
+.sidebar-elig-btn {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+    background: linear-gradient(135deg, var(--accent-subtle), rgba(92, 196, 142, 0.08));
+    border: 1px solid var(--accent-border);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    text-align: left;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: transform var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.sidebar-elig-btn:hover {
+    border-color: var(--accent-primary);
+    box-shadow: 0 4px 16px rgba(122, 106, 242, 0.16);
+    transform: translateY(-1px);
+}
+
+.seb-icon {
+    width: 30px;
+    height: 30px;
+    border-radius: var(--radius-sm);
+    background: var(--accent-gradient);
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.seb-text {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.seb-text strong {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.seb-text small {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.inline-dashboard-btn {
+    margin-top: 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent-border);
+    background: var(--accent-gradient);
+    color: #ffffff;
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform var(--transition-fast), box-shadow var(--transition-fast), opacity var(--transition-fast);
+    box-shadow: 0 3px 12px rgba(90, 74, 227, 0.25);
+}
+
+.inline-dashboard-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 5px 16px rgba(90, 74, 227, 0.35);
+}
+
+.elig-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 6, 10, 0.62);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    z-index: 80;
+}
+
+.elig-backdrop.show {
+    display: block;
+}
+
+.elig-modal {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    width: min(1040px, 94vw);
+    max-height: 90vh;
+    background: var(--bg-surface-solid);
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-xl);
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.52);
+    z-index: 90;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(-50%, -48%) scale(0.98);
+    transition: opacity 0.24s var(--ease-out-expo), transform 0.28s var(--ease-out-expo);
+}
+
+.elig-modal.open {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translate(-50%, -50%) scale(1);
+}
+
+.elig-modal-header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-header);
+    backdrop-filter: blur(16px);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+}
+
+.elig-header-left {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.elig-brand-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent-primary);
+}
+
+.elig-modal-header h2 {
+    font-size: 19px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+}
+
+.elig-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.elig-modal-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 22px 24px 28px;
+}
+
+.elig-kyc-gate {
+    max-width: 480px;
+    margin: 42px auto;
+    text-align: center;
+    padding: 32px 24px;
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+}
+
+.elig-kyc-gate[hidden],
+.elig-content[hidden],
+.why-bucket[hidden] {
+    display: none;
+}
+
+.elig-gate-icon {
+    width: 54px;
+    height: 54px;
+    border-radius: var(--radius-md);
+    background: var(--accent-subtle);
+    border: 1px solid var(--accent-border);
+    color: var(--accent-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.elig-kyc-gate h3 {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.elig-kyc-gate p {
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+}
+
+.elig-gate-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.elig-quick-btn {
+    padding: 9px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-medium);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+
+.elig-quick-btn:hover {
+    border-color: var(--accent-primary);
+    transform: translateY(-1px);
+}
+
+.elig-quick-btn.primary {
+    background: var(--accent-gradient);
+    border-color: transparent;
+    color: #ffffff;
+}
+
+.elig-content {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.elig-profile-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 16px 20px;
+    border-radius: var(--radius-md);
+    background: linear-gradient(135deg, var(--bg-surface-elevated) 0%, var(--accent-subtle) 100%);
+    border: 1px solid var(--border-subtle);
+}
+
+.elig-identity {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.elig-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: var(--radius-md);
+    background: var(--accent-gradient);
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.elig-name-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.elig-name-row h3 {
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.elig-cid-chip {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    background: var(--bg-surface-solid);
+    border: 1px solid var(--border-medium);
+    color: var(--accent-primary);
+}
+
+.elig-app-status {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 3px;
+}
+
+.elig-verdict-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+}
+
+.elig-verdict-label {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.elig-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+}
+
+.elig-kpi-card {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 13px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: transform var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.elig-kpi-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--border-highlight);
+    box-shadow: var(--card-shadow);
+}
+
+.elig-kpi-card.highlight {
+    border-color: var(--accent-border);
+    background: linear-gradient(155deg, var(--bg-surface-elevated), var(--accent-subtle));
+}
+
+.ek-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.ek-value {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+}
+
+.ek-sub {
+    font-size: 10.5px;
+    color: var(--text-secondary);
+}
+
+.elig-two-col {
+    display: grid;
+    grid-template-columns: 0.92fr 1.28fr;
+    gap: 14px;
+}
+
+.elig-panel-card {
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.epc-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.epc-head h4 {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.epc-tag {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    background: var(--accent-subtle);
+    color: var(--accent-primary);
+    border: 1px solid var(--accent-border);
+}
+
+/* CIBIL Semi-Circular Gauge */
+.cibil-gauge-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 240px;
+    margin: 4px auto 0;
+}
+
+.cibil-gauge-svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.gauge-track {
+    stroke: var(--bg-surface-secondary);
+}
+
+.gauge-fill {
+    stroke: var(--accent-primary);
+    transition: stroke-dashoffset 0.65s var(--ease-out-expo), stroke 0.3s ease;
+}
+
+.gauge-fill.passed {
+    stroke: var(--color-success);
+}
+
+.gauge-fill.failed {
+    stroke: var(--color-danger);
+}
+
+.gauge-fill.pending {
+    stroke: var(--text-muted);
+}
+
+.gauge-threshold-tick {
+    stroke: var(--color-warning);
+}
+
+.gauge-threshold-label {
+    fill: var(--color-warning);
+    font-size: 9.5px;
+    font-weight: 700;
+    font-family: var(--font-sans);
+}
+
+.gauge-scale-min,
+.gauge-scale-max {
+    fill: var(--text-muted);
+    font-size: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.gauge-center-readout {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+}
+
+.gauge-score-num {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+}
+
+.gauge-score-caption {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    margin-top: 3px;
+}
+
+.epc-note {
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+/* Why This Result Card */
+.why-headline {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.why-summary {
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+}
+
+.why-buckets {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.why-bucket {
+    padding: 8px 11px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+}
+
+.wb-title {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+}
+
+.wb-title.passed { color: var(--color-success); }
+.wb-title.failed { color: var(--color-danger); }
+.wb-title.pending { color: var(--color-warning); }
+
+.why-bucket ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+
+.why-bucket li::before {
+    content: "• ";
+    color: var(--text-muted);
+}
+
+.why-disclaimer {
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    border: 1px dashed var(--border-subtle);
+}
+
+/* 6-Item Eligibility Checklist */
+.elig-checklist-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+}
+
+.check-item-card {
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: border-color var(--transition-fast);
+}
+
+.check-item-card.status-passed { border-left: 3px solid var(--color-success); }
+.check-item-card.status-failed { border-left: 3px solid var(--color-danger); }
+.check-item-card.status-pending { border-left: 3px solid var(--color-warning); }
+
+.check-item-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.check-item-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.check-pill {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+}
+
+.check-pill.passed {
+    background: var(--color-success-bg);
+    color: var(--color-success);
+    border: 1px solid var(--color-success-border);
+}
+
+.check-pill.failed {
+    background: var(--color-danger-bg);
+    color: var(--color-danger);
+    border: 1px solid var(--color-danger-border);
+}
+
+.check-pill.pending {
+    background: var(--color-warning-bg);
+    color: var(--color-warning);
+    border: 1px solid var(--color-warning-border);
+}
+
+.check-item-metrics {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.check-item-metrics strong {
+    color: var(--text-primary);
+}
+
+.check-item-reason {
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--text-muted);
+}
+
+/* Interactive EMI Simulator */
+.sim-subtitle {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.sim-readonly-pill {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: var(--radius-full);
+    background: var(--color-info-bg);
+    color: var(--color-info);
+    border: 1px solid var(--color-info-border);
+}
+
+.sim-layout {
+    display: grid;
+    grid-template-columns: 1fr 1.15fr;
+    gap: 18px;
+    align-items: start;
+}
+
+.sim-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.sim-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.sim-field label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.sim-field-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.sim-num-input {
+    width: 132px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-medium);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 13px;
+    font-weight: 600;
+    outline: none;
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.sim-num-input.full {
+    width: 100%;
+}
+
+.sim-num-input:focus {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.sim-slider {
+    width: 100%;
+    accent-color: var(--accent-primary);
+    cursor: pointer;
+}
+
+.sim-range-bounds {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+.sim-row-2 {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: 12px;
+}
+
+.tenure-pills {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+
+.tenure-pill {
+    padding: 8px 6px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-medium);
+    background: var(--bg-input);
+    color: var(--text-secondary);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+
+.tenure-pill:hover {
+    border-color: var(--accent-border);
+    color: var(--text-primary);
+}
+
+.tenure-pill.active {
+    background: var(--accent-gradient);
+    border-color: transparent;
+    color: #ffffff;
+}
+
+.sim-reset-link {
+    border: none;
+    background: transparent;
+    color: var(--accent-primary);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+.sim-results {
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 15px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 13px;
+}
+
+.sim-res-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.sim-emi-hero {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sim-emi-hero span {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.sim-emi-hero strong {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+}
+
+.sim-res-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+}
+
+.sim-stat {
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sim-stat span {
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+.sim-stat strong {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.sim-foir-bar-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.sim-foir-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+.sim-foir-track {
+    position: relative;
+    height: 9px;
+    border-radius: var(--radius-full);
+    background: var(--bg-surface-secondary);
+    overflow: hidden;
+}
+
+.sim-foir-fill {
+    height: 100%;
+    border-radius: var(--radius-full);
+    background: var(--color-success);
+    transition: width 0.3s var(--ease-out-expo), background-color 0.25s ease;
+}
+
+.sim-foir-fill.over-limit {
+    background: var(--color-danger);
+}
+
+.sim-foir-threshold {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    background: var(--text-primary);
+    opacity: 0.6;
+}
+
+.sim-submit-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 4px;
+}
+
+.sim-submit-btn {
+    width: 100%;
+    padding: 11px 16px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: var(--accent-gradient);
+    color: #ffffff;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform var(--transition-fast), opacity var(--transition-fast), box-shadow var(--transition-fast);
+    box-shadow: 0 4px 14px rgba(90, 74, 227, 0.28);
+}
+
+.sim-submit-btn:hover:not(:disabled) {
+    background: var(--accent-gradient-hover);
+    transform: translateY(-1px);
+}
+
+.sim-submit-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.sim-submit-note {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
 .sidebar-backdrop {
     display: none;
     position: fixed;
@@ -2264,12 +3192,32 @@ body.ai-generating .ai-indicator-dot {
     }
 
     .header-model-chip,
-    .monitor-btn-label {
+    .monitor-btn-label,
+    .elig-btn-label {
         display: none;
     }
 
     .monitor-drawer {
         width: 100vw;
+    }
+
+    .elig-modal {
+        width: 100vw;
+        max-height: 100vh;
+        height: 100vh;
+        border-radius: 0;
+    }
+
+    .elig-kpi-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .elig-two-col,
+    .elig-checklist-grid,
+    .sim-layout,
+    .sim-row-2,
+    .sim-res-grid {
+        grid-template-columns: 1fr;
     }
 
     .cursor-spotlight {
@@ -2322,6 +3270,11 @@ body.ai-generating .ai-indicator-dot {
     .profile-chip,
     .footer-link-btn,
     .sidebar-monitor-card,
+    .sidebar-elig-btn,
+    .elig-modal,
+    .elig-kpi-card,
+    .gauge-fill,
+    .sim-foir-fill,
     .monitor-drawer,
     .dist-seg,
     .messages-container {

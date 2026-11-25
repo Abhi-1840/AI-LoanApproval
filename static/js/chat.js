@@ -225,6 +225,7 @@ function switchSession(targetSessionId) {
 
     renderSidebarSessions();
     fetchMonitoringSnapshot();
+    syncEligibilitySidebarHint();
 
     // Close mobile drawer if open
     if (sidebarBackdrop && sidebarBackdrop.classList.contains("show")) {
@@ -324,6 +325,7 @@ window.onload = async function () {
         await startNewChat();
     }
     fetchMonitoringSnapshot();
+    syncEligibilitySidebarHint();
 };
 
 async function startNewChat() {
@@ -345,6 +347,7 @@ async function startNewChat() {
     adjustTextareaHeight();
     renderSidebarSessions();
     fetchMonitoringSnapshot();
+    syncEligibilitySidebarHint();
 }
 
 newChatBtn.addEventListener("click", startNewChat);
@@ -425,13 +428,20 @@ async function sendMessage() {
         const cleanReply = sanitizeMessage(data.response_text);
         addMessage(cleanReply, "assistant");
 
-        // If user just completed in-chat registration, update session record and title
+        if (data.open_eligibility_dashboard) {
+            openEligibilityDashboard();
+        }
+
+        // If user just completed in-chat registration or logged out, refresh eligibility metadata
         if (cleanReply.includes("Registration Completed Successfully")) {
             const nameMatch = cleanReply.match(/Welcome to AI Loan Approval System, \*\*([^*]+)\*\*/i);
             const custMatch = cleanReply.match(/Customer ID\*\*:\s*`([^`]+)`/i);
             const newTitle = nameMatch ? `KYC: ${nameMatch[1]} (${custMatch ? custMatch[1] : 'Verified'})` : "KYC: Verified Customer";
             currentSessionTitle = newTitle;
             updateSessionRecord(null, newTitle);
+            syncEligibilitySidebarHint();
+        } else if (cleanReply.includes("Logged out successfully")) {
+            syncEligibilitySidebarHint();
         }
 
     } catch (err) {
@@ -492,10 +502,12 @@ async function handleOrchestration(cmd, user_text, chatData = null) {
                     • Monthly Salary: <strong>₹${Number(c.salary).toLocaleString('en-IN')}</strong><br>
                     • Salary-Based Preliminary Limit (15×): <strong>Up to ₹${prelimLimit}</strong><br>
                     • Application Status: ${badgeHtml}<br><br>
-                    ${nextStepHtml}
+                    ${nextStepHtml}<br>
+                    <button type="button" class="inline-dashboard-btn" data-open-elig="true">View My Eligibility Dashboard →</button>
                 `;
                 addMessage(cardHtml, "assistant", false);
                 updateSessionRecord(null, newTitle);
+                syncEligibilitySidebarHint();
             } else {
                 addMessage(data.message || "Customer verification failed. Please check the Customer ID.", "assistant");
             }
@@ -888,6 +900,7 @@ function openMonitoringDrawer() {
     monitoringDrawer.setAttribute("aria-hidden", "false");
     if (monitoringBackdrop) monitoringBackdrop.classList.add("show");
     fetchMonitoringSnapshot();
+    syncEligibilitySidebarHint();
 }
 
 function closeMonitoringDrawer() {
@@ -1129,4 +1142,404 @@ function updateMonitoringDashboard(snapshot) {
             }).join("");
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// INTERACTIVE LOAN ELIGIBILITY DASHBOARD CONTROLLER
+// ──────────────────────────────────────────────────────────────────────────
+const eligibilityModal = document.getElementById("eligibilityModal");
+const eligibilityBackdrop = document.getElementById("eligibilityBackdrop");
+const openEligibilityBtn = document.getElementById("openEligibilityBtn");
+const sidebarEligibilityBtn = document.getElementById("sidebarEligibilityBtn");
+const closeEligibilityBtn = document.getElementById("closeEligibilityBtn");
+const refreshEligibilityBtn = document.getElementById("refreshEligibilityBtn");
+const eligUnverifiedGate = document.getElementById("eligUnverifiedGate");
+const eligDashboardContent = document.getElementById("eligDashboardContent");
+
+const simAmountInput = document.getElementById("simAmountInput");
+const simAmountSlider = document.getElementById("simAmountSlider");
+const simRateInput = document.getElementById("simRateInput");
+const simResetRateBtn = document.getElementById("simResetRateBtn");
+const simTenureGroup = document.getElementById("simTenureGroup");
+const simSubmitUnderwriteBtn = document.getElementById("simSubmitUnderwriteBtn");
+
+let simSelectedTenure = 60;
+let simDebounceTimer = null;
+let currentEligPayload = null;
+
+function formatINR(num) {
+    if (num === null || num === undefined || Number.isNaN(Number(num))) return "—";
+    return "₹" + Math.round(Number(num)).toLocaleString("en-IN");
+}
+
+function setStatusBadgeClass(el, tone, text) {
+    if (!el) return;
+    el.textContent = text;
+    el.className = "status-badge";
+    if (tone === "approved") el.classList.add("approved");
+    else if (tone === "rejected") el.classList.add("rejected");
+    else if (tone === "preapproved") el.classList.add("preapproved");
+    else el.classList.add("verified");
+}
+
+async function syncEligibilitySidebarHint() {
+    const sub = document.getElementById("sidebarEligSub");
+    if (!sub || !session_id) return;
+    try {
+        const resp = await fetch(`/api/eligibility-dashboard?session_id=${encodeURIComponent(session_id)}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.verified && data.customer) {
+            sub.textContent = `${data.customer.name} (${data.customer.customer_id})`;
+        } else {
+            sub.textContent = "Verify KYC to unlock personal view";
+        }
+    } catch (e) {
+        // Ignore transient network errors
+    }
+}
+
+async function openEligibilityDashboard() {
+    if (!eligibilityModal) return;
+    // Close mobile sidebar or monitor drawer if open
+    if (typeof closeMonitoringDrawer === "function") closeMonitoringDrawer();
+    if (sidebar && sidebar.classList.contains("mobile-open")) {
+        sidebar.classList.remove("mobile-open");
+        if (sidebarBackdrop) sidebarBackdrop.classList.remove("show");
+    }
+
+    eligibilityModal.classList.add("open");
+    eligibilityModal.setAttribute("aria-hidden", "false");
+    if (eligibilityBackdrop) eligibilityBackdrop.classList.add("show");
+    const modalBody = eligibilityModal.querySelector(".elig-modal-body");
+    if (modalBody) modalBody.scrollTop = 0;
+    await loadEligibilityDashboard();
+}
+
+function closeEligibilityDashboard() {
+    if (!eligibilityModal) return;
+    eligibilityModal.classList.remove("open");
+    eligibilityModal.setAttribute("aria-hidden", "true");
+    if (eligibilityBackdrop) eligibilityBackdrop.classList.remove("show");
+}
+
+if (openEligibilityBtn) openEligibilityBtn.addEventListener("click", openEligibilityDashboard);
+if (sidebarEligibilityBtn) sidebarEligibilityBtn.addEventListener("click", openEligibilityDashboard);
+if (closeEligibilityBtn) closeEligibilityBtn.addEventListener("click", closeEligibilityDashboard);
+if (eligibilityBackdrop) eligibilityBackdrop.addEventListener("click", closeEligibilityDashboard);
+if (refreshEligibilityBtn) refreshEligibilityBtn.addEventListener("click", loadEligibilityDashboard);
+
+// Delegated listener for inline "View My Eligibility Dashboard" buttons inside chat bubbles
+if (messagesContainer) {
+    messagesContainer.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-open-elig='true']");
+        if (btn) {
+            openEligibilityDashboard();
+        }
+    });
+}
+
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && eligibilityModal && eligibilityModal.classList.contains("open")) {
+        closeEligibilityDashboard();
+    }
+});
+
+// Quick KYC triggers from unverified gate
+const eligQuickCust01 = document.getElementById("eligQuickCust01");
+const eligQuickCust99 = document.getElementById("eligQuickCust99");
+const eligQuickRegister = document.getElementById("eligQuickRegister");
+
+function triggerPromptFromDashboard(promptText) {
+    closeEligibilityDashboard();
+    inputField.value = promptText;
+    adjustTextareaHeight();
+    sendMessage();
+}
+
+if (eligQuickCust01) eligQuickCust01.addEventListener("click", () => triggerPromptFromDashboard("cust01"));
+if (eligQuickCust99) eligQuickCust99.addEventListener("click", () => triggerPromptFromDashboard("cust99"));
+if (eligQuickRegister) eligQuickRegister.addEventListener("click", () => triggerPromptFromDashboard("I am a new customer"));
+
+async function loadEligibilityDashboard() {
+    if (!session_id) {
+        await startNewChat();
+    }
+    try {
+        const resp = await fetch(`/api/eligibility-dashboard?session_id=${encodeURIComponent(session_id)}`);
+        if (!resp.ok) return;
+        const payload = await resp.json();
+        renderEligibilityDashboard(payload);
+    } catch (err) {
+        // Handle offline gracefully
+    }
+}
+
+function renderEligibilityDashboard(payload) {
+    currentEligPayload = payload;
+    if (!payload || !payload.verified || !payload.customer) {
+        if (eligUnverifiedGate) eligUnverifiedGate.hidden = false;
+        if (eligDashboardContent) eligDashboardContent.hidden = true;
+        const msgEl = document.getElementById("eligGateMessage");
+        if (msgEl && payload && payload.message) {
+            msgEl.textContent = payload.message;
+        }
+        return;
+    }
+
+    if (eligUnverifiedGate) eligUnverifiedGate.hidden = true;
+    if (eligDashboardContent) eligDashboardContent.hidden = false;
+
+    const c = payload.customer;
+    const cs = payload.credit_score_card || {};
+    const why = payload.why_this_result || {};
+    const checklist = Array.isArray(payload.checklist) ? payload.checklist : [];
+
+    // 1. Profile Banner & Overview KPIs
+    const nameStr = c.name || "Customer";
+    const avatarEl = document.getElementById("eligAvatarInitial");
+    if (avatarEl) avatarEl.textContent = nameStr.charAt(0).toUpperCase();
+    document.getElementById("eligCustomerName").textContent = nameStr;
+    document.getElementById("eligCustomerId").textContent = c.customer_id || "—";
+    document.getElementById("eligAppStatus").textContent = c.application_status || "—";
+    setStatusBadgeClass(document.getElementById("eligOverallBadge"), c.overall_tone, c.overall_status || "Pending");
+
+    document.getElementById("eligSalaryVal").textContent = c.salary > 0 ? formatINR(c.salary) : "Missing";
+    document.getElementById("eligPrelimLimitVal").textContent = c.preliminary_limit > 0 ? formatINR(c.preliminary_limit) : "—";
+    document.getElementById("eligCreditVal").textContent = c.credit_score > 0 ? String(c.credit_score) : "Missing";
+    document.getElementById("eligExistingEmiVal").textContent = formatINR(c.existing_emi || 0);
+    document.getElementById("eligFreeEmiSub").textContent = `Free capacity: ${formatINR(c.max_affordable_emi || 0)}/mo`;
+
+    const reqValEl = document.getElementById("eligRequestedAmtVal");
+    const tenSubEl = document.getElementById("eligTenureSub");
+    if (c.requested_loan_amount && c.requested_loan_amount > 0) {
+        reqValEl.textContent = formatINR(c.requested_loan_amount);
+        tenSubEl.textContent = c.requested_tenure ? `Applied tenure: ${c.requested_tenure} mo` : `Band tenure: ${c.recommended_tenure} mo`;
+    } else {
+        reqValEl.textContent = "Not Requested";
+        tenSubEl.textContent = c.salary > 0 ? `Band tenure: ${c.recommended_tenure} mo` : "Band tenure: Pending";
+    }
+
+    // 2. Credit Score SVG Arc Gauge (300 to 900, circumference = 270.18)
+    const arcTotal = 270.18;
+    const gaugeFill = document.getElementById("cibilGaugeFill");
+    const gaugeNum = document.getElementById("gaugeScoreNum");
+    const gaugePill = document.getElementById("gaugeStatusPill");
+    const gaugeExp = document.getElementById("gaugeExplanation");
+
+    if (cs.score && cs.score > 0) {
+        const clamped = Math.max(cs.min_scale || 300, Math.min(cs.max_scale || 900, cs.score));
+        const ratio = (clamped - (cs.min_scale || 300)) / ((cs.max_scale || 900) - (cs.min_scale || 300));
+        if (gaugeFill) {
+            gaugeFill.style.strokeDashoffset = (arcTotal * (1 - ratio)).toFixed(2);
+            gaugeFill.classList.remove("passed", "failed", "pending");
+            gaugeFill.classList.add(cs.status || "pending");
+        }
+        if (gaugeNum) gaugeNum.textContent = String(cs.score);
+    } else {
+        if (gaugeFill) {
+            gaugeFill.style.strokeDashoffset = String(arcTotal);
+            gaugeFill.classList.remove("passed", "failed");
+            gaugeFill.classList.add("pending");
+        }
+        if (gaugeNum) gaugeNum.textContent = "—";
+    }
+    if (gaugePill) {
+        gaugePill.className = `check-pill ${cs.status || "pending"}`;
+        gaugePill.textContent = cs.status === "passed" ? "Passed" : (cs.status === "failed" ? "Failed" : "Pending");
+    }
+    if (gaugeExp) gaugeExp.textContent = cs.explanation || "";
+
+    // 3. "Why this result?" Card
+    document.getElementById("whyHeadline").textContent = why.headline || "Eligibility Summary";
+    document.getElementById("whySummary").textContent = why.summary || "";
+    document.getElementById("whyDisclaimer").textContent = why.preliminary_vs_final_note || "";
+
+    function populateWhyBucket(boxId, listId, items) {
+        const box = document.getElementById(boxId);
+        const ul = document.getElementById(listId);
+        if (!box || !ul) return;
+        if (Array.isArray(items) && items.length > 0) {
+            box.hidden = false;
+            ul.innerHTML = items.map((t) => `<li>${escapeMonitorHtml(t)}</li>`).join("");
+        } else {
+            box.hidden = true;
+            ul.innerHTML = "";
+        }
+    }
+    populateWhyBucket("whyPassedBox", "whyPassedList", why.passed_conditions);
+    populateWhyBucket("whyFailedBox", "whyFailedList", why.failed_conditions);
+    populateWhyBucket("whyPendingBox", "whyPendingList", why.pending_conditions);
+
+    // 4. 6-Item Eligibility Checklist Grid
+    const checklistGrid = document.getElementById("eligChecklistGrid");
+    if (checklistGrid) {
+        checklistGrid.innerHTML = checklist.map((item) => {
+            const st = escapeMonitorHtml(item.status || "pending");
+            const stLabel = st === "passed" ? "Passed" : (st === "failed" ? "Failed" : "Pending");
+            return `
+                <div class="check-item-card status-${st}">
+                    <div class="check-item-top">
+                        <span class="check-item-title">${escapeMonitorHtml(item.label)}</span>
+                        <span class="check-pill ${st}">${stLabel}</span>
+                    </div>
+                    <div class="check-item-metrics">
+                        <span>Current: <strong>${escapeMonitorHtml(item.actual)}</strong></span>
+                        <span>Rule: ${escapeMonitorHtml(item.required)}</span>
+                    </div>
+                    <div class="check-item-reason">${escapeMonitorHtml(item.reason)}</div>
+                </div>
+            `;
+        }).join("");
+    }
+
+    // 5. Initialize Interactive Simulator Controls without modifying profile
+    const maxSlider = Math.max(2000000, Math.round((c.preliminary_limit || 1000000) * 1.4));
+    const defaultAmt = c.requested_loan_amount && c.requested_loan_amount > 0
+        ? Math.round(c.requested_loan_amount)
+        : Math.max(50000, Math.min(500000, Math.round((c.preliminary_limit || 500000) * 0.5)));
+
+    if (simAmountSlider) {
+        simAmountSlider.max = String(maxSlider);
+        simAmountSlider.value = String(Math.min(maxSlider, defaultAmt));
+    }
+    if (simAmountInput) simAmountInput.value = String(defaultAmt);
+    const maxLabel = document.getElementById("simSliderMaxLabel");
+    if (maxLabel) maxLabel.textContent = formatINR(maxSlider);
+
+    simSelectedTenure = Number(c.requested_tenure || c.recommended_tenure || 60);
+    if (![48, 60, 72].includes(simSelectedTenure)) simSelectedTenure = 60;
+    updateTenureButtonsUI();
+
+    if (simRateInput) simRateInput.value = String((payload.system_config && payload.system_config.interest_rate_pa) || 12.0);
+    runBackendSimulation();
+}
+
+function updateTenureButtonsUI() {
+    if (!simTenureGroup) return;
+    simTenureGroup.querySelectorAll(".tenure-pill").forEach((btn) => {
+        const val = Number(btn.getAttribute("data-tenure"));
+        btn.classList.toggle("active", val === simSelectedTenure);
+    });
+}
+
+function scheduleSimulation() {
+    window.clearTimeout(simDebounceTimer);
+    simDebounceTimer = window.setTimeout(runBackendSimulation, 90);
+}
+
+async function runBackendSimulation() {
+    if (!session_id || !currentEligPayload || !currentEligPayload.verified) return;
+    const rawAmt = simAmountInput ? simAmountInput.value.trim() : "";
+    const amt = Number(rawAmt);
+    if (!rawAmt || Number.isNaN(amt) || amt <= 0) {
+        const badge = document.getElementById("simAffordBadge");
+        if (badge) setStatusBadgeClass(badge, "pending", "Enter Loan Amount");
+        return;
+    }
+    const rate = Number(simRateInput ? simRateInput.value : 12.0);
+
+    try {
+        const resp = await fetch("/api/eligibility-simulate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                session_id: session_id,
+                loan_amount: amt,
+                tenure_months: simSelectedTenure,
+                interest_rate: rate,
+            }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.error || !data.results) {
+            const badge = document.getElementById("simAffordBadge");
+            if (badge) setStatusBadgeClass(badge, "rejected", data.error || "Invalid Input");
+            return;
+        }
+        const r = data.results;
+        document.getElementById("simMonthlyEmi").textContent = formatINR(r.monthly_emi_rounded);
+        document.getElementById("simTotalInterest").textContent = formatINR(r.total_interest_rounded);
+        document.getElementById("simTotalRepayment").textContent = formatINR(r.total_repayment_rounded);
+        document.getElementById("simFoirPct").textContent = `${r.foir_pct.toFixed(1)}%`;
+
+        setStatusBadgeClass(document.getElementById("simAffordBadge"), r.affordability_tone, r.affordability_status);
+
+        const foirBar = document.getElementById("simFoirBar");
+        if (foirBar) {
+            foirBar.style.width = `${Math.min(100, Math.max(0, r.foir_pct)).toFixed(1)}%`;
+            foirBar.classList.toggle("over-limit", !r.within_foir);
+        }
+
+        const noteEl = document.getElementById("simSubmitNote");
+        if (noteEl) {
+            noteEl.textContent = r.uses_custom_rate
+                ? `Note: Simulation preview uses ${rate}%. Real underwriting applies the fixed system rate of ${r.system_interest_rate_pa}% p.a.`
+                : `Real underwriting runs authoritative Python rules at fixed ${r.system_interest_rate_pa}% p.a. and generates a sanction letter if approved.`;
+        }
+    } catch (e) {
+        // Ignore transient failure
+    }
+}
+
+if (simAmountSlider && simAmountInput) {
+    simAmountSlider.addEventListener("input", () => {
+        simAmountInput.value = simAmountSlider.value;
+        scheduleSimulation();
+    });
+    simAmountInput.addEventListener("input", () => {
+        const v = Number(simAmountInput.value);
+        if (!Number.isNaN(v) && v >= 0) {
+            simAmountSlider.value = String(Math.min(Number(simAmountSlider.max), v));
+        }
+        scheduleSimulation();
+    });
+}
+
+if (simRateInput) {
+    simRateInput.addEventListener("input", scheduleSimulation);
+}
+
+if (simResetRateBtn && simRateInput) {
+    simResetRateBtn.addEventListener("click", () => {
+        simRateInput.value = "12.0";
+        runBackendSimulation();
+    });
+}
+
+if (simTenureGroup) {
+    simTenureGroup.addEventListener("click", (e) => {
+        const btn = e.target.closest(".tenure-pill");
+        if (!btn) return;
+        simSelectedTenure = Number(btn.getAttribute("data-tenure")) || 60;
+        updateTenureButtonsUI();
+        runBackendSimulation();
+    });
+}
+
+if (simSubmitUnderwriteBtn) {
+    simSubmitUnderwriteBtn.addEventListener("click", async () => {
+        if (!currentEligPayload || !currentEligPayload.verified || isProcessing) return;
+        const amt = Number(simAmountInput ? simAmountInput.value : 0);
+        if (!amt || amt <= 0) return;
+
+        simSubmitUnderwriteBtn.disabled = true;
+        const origLabel = simSubmitUnderwriteBtn.textContent;
+        simSubmitUnderwriteBtn.textContent = "Submitting for Underwriting...";
+
+        try {
+            closeEligibilityDashboard();
+            if (emptyState && emptyState.parentNode === messagesContainer) {
+                emptyState.style.display = "none";
+            }
+            addMessage(`Submit loan application for ${formatINR(amt)} (${simSelectedTenure} months)`, "user");
+            await handleOrchestration("[[FLASK_CALL:UNDERWRITE]]", String(amt), {
+                loan_amount: amt,
+                tenure: simSelectedTenure,
+            });
+            await loadEligibilityDashboard();
+        } finally {
+            simSubmitUnderwriteBtn.disabled = false;
+            simSubmitUnderwriteBtn.textContent = origLabel;
+        }
+    });
 }

@@ -1040,6 +1040,456 @@ def evaluate_customer_profile_eligibility(customer):
     }
 
 
+SYSTEM_INTEREST_RATE = 12.0
+
+
+def build_eligibility_dashboard_payload(session_id, refresh_from_firebase=True):
+    """
+    Build the authoritative read-only Loan Eligibility Dashboard payload for a session's
+    verified customer using existing underwriting & EMI functions.
+    Never modifies customer records or triggers underwriting.
+    """
+    verified_cust, assessment = get_verified_customer_context(session_id, refresh_from_firebase=refresh_from_firebase)
+    if not verified_cust or not assessment:
+        return {
+            "verified": False,
+            "requires_kyc": True,
+            "system_config": {
+                "min_cibil": 700,
+                "max_cibil": 900,
+                "min_cibil_scale": 300,
+                "min_age": 21,
+                "max_age": 65,
+                "salary_multiplier": 15,
+                "max_foir_pct": 50.0,
+                "allowed_tenures": [48, 60, 72],
+                "interest_rate_pa": SYSTEM_INTEREST_RATE,
+            },
+            "message": "Please complete KYC verification first by entering your Customer ID (e.g., cust01 or cust99) or registering as a new customer.",
+        }
+
+    salary = assessment["salary"]
+    credit = assessment["credit_score"]
+    age = assessment["age"]
+    existing_emi = assessment["existing_emi"]
+    preliminary_limit = assessment["preliminary_limit"]
+    max_foir_budget = assessment["max_foir_budget"]
+    max_affordable_emi = assessment["max_affordable_emi"]
+    rec_tenure = assessment["recommended_tenure"]
+
+    req_amt = verified_cust.get("last_requested_amount")
+    req_tenure = verified_cust.get("last_requested_tenure")
+    last_uw = verified_cust.get("last_underwriting_result")
+
+    # ── 1. Age Criterion ──
+    if not age or age <= 0:
+        age_item = {
+            "key": "age_requirement",
+            "label": "Age Requirement (21–65 yrs)",
+            "status": "pending",
+            "actual": "Not provided",
+            "required": "21–65 years",
+            "reason": "Applicant age or date of birth is missing from the profile and cannot be evaluated yet.",
+        }
+    elif 21 <= age <= 65:
+        age_item = {
+            "key": "age_requirement",
+            "label": "Age Requirement (21–65 yrs)",
+            "status": "passed",
+            "actual": f"{age} years",
+            "required": "21–65 years",
+            "reason": f"Applicant age ({age} years) satisfies the mandatory 21–65 years range.",
+        }
+    else:
+        age_item = {
+            "key": "age_requirement",
+            "label": "Age Requirement (21–65 yrs)",
+            "status": "failed",
+            "actual": f"{age} years",
+            "required": "21–65 years",
+            "reason": f"Applicant age ({age} years) is outside the eligible 21–65 years range.",
+        }
+
+    # ── 2. Minimum CIBIL Score Criterion ──
+    if not credit or credit <= 0:
+        cibil_status = "pending"
+        cibil_actual = "Not available"
+        cibil_reason = "CIBIL credit score is missing from the profile and has not been evaluated."
+    elif 700 <= credit <= 900:
+        cibil_status = "passed"
+        cibil_actual = str(credit)
+        cibil_reason = f"Verified CIBIL score ({credit}) meets the configured minimum threshold of 700."
+    elif credit > 900:
+        cibil_status = "failed"
+        cibil_actual = str(credit)
+        cibil_reason = f"Credit score ({credit}) exceeds the valid 300–900 CIBIL scale."
+    else:
+        cibil_status = "failed"
+        cibil_actual = str(credit)
+        cibil_reason = f"CIBIL score ({credit}) is below the configured minimum threshold of 700."
+
+    cibil_item = {
+        "key": "minimum_cibil",
+        "label": "Minimum CIBIL Score (≥ 700)",
+        "status": cibil_status,
+        "actual": cibil_actual,
+        "required": "≥ 700 (300–900)",
+        "reason": cibil_reason,
+    }
+
+    # ── 3. Salary-Based Preliminary Limit Criterion ──
+    if salary <= 0:
+        limit_item = {
+            "key": "salary_preliminary_limit",
+            "label": "Salary-Based Preliminary Limit (15×)",
+            "status": "pending",
+            "actual": "Salary missing",
+            "required": "> ₹0 net salary",
+            "reason": "Monthly net salary is missing, so the 15× salary-based preliminary limit cannot be calculated.",
+        }
+    else:
+        limit_item = {
+            "key": "salary_preliminary_limit",
+            "label": "Salary-Based Preliminary Limit (15×)",
+            "status": "passed",
+            "actual": f"₹{int(preliminary_limit):,}",
+            "required": "15× ₹" + f"{int(salary):,}",
+            "reason": f"Monthly net salary of ₹{int(salary):,} establishes a salary-based preliminary cap of ₹{int(preliminary_limit):,}.",
+        }
+
+    # ── 4. Requested Amount vs Limit & FOIR & Tenure Evaluation ──
+    eval_emi = None
+    eval_foir = None
+    if req_amt is not None and req_amt > 0:
+        eval_tenure = int(req_tenure) if req_tenure else rec_tenure
+        eval_emi = calculate_emi(float(req_amt), SYSTEM_INTEREST_RATE, eval_tenure) or 0.0
+        total_emi = existing_emi + eval_emi
+        eval_foir = (total_emi / salary) * 100.0 if salary > 0 else 100.0
+
+        # FOIR check matching underwrite()
+        if salary <= 0:
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "pending",
+                "actual": "Salary missing",
+                "required": "≤ 50.0% of salary",
+                "reason": "Monthly net salary is required to compute FOIR affordability.",
+            }
+        elif round(eval_foir, 2) <= 50.00 and total_emi <= (max_foir_budget + 0.01):
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "passed",
+                "actual": f"{eval_foir:.1f}% (₹{int(total_emi):,}/mo)",
+                "required": f"≤ 50.0% (₹{int(max_foir_budget):,}/mo)",
+                "reason": f"Total monthly obligations of ₹{int(total_emi):,} ({eval_foir:.1f}% FOIR) fit within the 50% limit.",
+            }
+        else:
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "failed",
+                "actual": f"{eval_foir:.1f}% (₹{int(total_emi):,}/mo)",
+                "required": f"≤ 50.0% (₹{int(max_foir_budget):,}/mo)",
+                "reason": f"Total monthly EMIs of ₹{int(total_emi):,} ({eval_foir:.1f}% FOIR) exceed 50% of salary (₹{int(max_foir_budget):,}).",
+            }
+
+        # Requested Amount vs Limit
+        if salary <= 0:
+            req_limit_item = {
+                "key": "requested_vs_limit",
+                "label": "Requested Loan vs. Eligibility Limit",
+                "status": "pending",
+                "actual": f"₹{int(req_amt):,}",
+                "required": "Salary limit missing",
+                "reason": "Salary-based limit is missing, so requested loan amount cannot be validated.",
+            }
+        elif req_amt <= preliminary_limit:
+            req_limit_item = {
+                "key": "requested_vs_limit",
+                "label": "Requested Loan vs. Eligibility Limit",
+                "status": "passed",
+                "actual": f"₹{int(req_amt):,}",
+                "required": f"≤ ₹{int(preliminary_limit):,}",
+                "reason": f"Requested amount ₹{int(req_amt):,} is within your ₹{int(preliminary_limit):,} preliminary limit.",
+            }
+        else:
+            req_limit_item = {
+                "key": "requested_vs_limit",
+                "label": "Requested Loan vs. Eligibility Limit",
+                "status": "failed",
+                "actual": f"₹{int(req_amt):,}",
+                "required": f"≤ ₹{int(preliminary_limit):,}",
+                "reason": f"Requested amount ₹{int(req_amt):,} exceeds your ₹{int(preliminary_limit):,} preliminary limit.",
+            }
+
+        # Applicable Tenure
+        if 48 <= eval_tenure <= 72:
+            tenure_item = {
+                "key": "applicable_tenure",
+                "label": "Applicable Loan Tenure (48–72 mo)",
+                "status": "passed",
+                "actual": f"{eval_tenure} months",
+                "required": "48–72 months",
+                "reason": f"Selected tenure ({eval_tenure} months) is within the allowed 48–72 months window.",
+            }
+        else:
+            tenure_item = {
+                "key": "applicable_tenure",
+                "label": "Applicable Loan Tenure (48–72 mo)",
+                "status": "failed",
+                "actual": f"{eval_tenure} months",
+                "required": "48–72 months",
+                "reason": f"Selected tenure ({eval_tenure} months) is outside the allowed 48–72 months range.",
+            }
+    else:
+        # No loan amount submitted yet: check if existing EMIs already fail FOIR, otherwise mark Pending
+        if salary <= 0:
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "pending",
+                "actual": "Salary missing",
+                "required": "≤ 50.0% of salary",
+                "reason": "Monthly net salary is missing; FOIR cannot be calculated.",
+            }
+        elif existing_emi > max_foir_budget + 0.01:
+            curr_foir = (existing_emi / salary) * 100.0
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "failed",
+                "actual": f"{curr_foir:.1f}% existing",
+                "required": f"≤ 50.0% (₹{int(max_foir_budget):,}/mo)",
+                "reason": f"Existing monthly EMIs (₹{int(existing_emi):,}) already exceed the 50% FOIR cap.",
+            }
+        else:
+            foir_item = {
+                "key": "foir_affordability",
+                "label": "FOIR Affordability (≤ 50%)",
+                "status": "pending",
+                "actual": f"₹{int(max_affordable_emi):,}/mo free capacity",
+                "required": f"≤ 50.0% (₹{int(max_foir_budget):,}/mo)",
+                "reason": f"Remaining EMI capacity is ₹{int(max_affordable_emi):,}/month; submit a loan amount to evaluate total FOIR.",
+            }
+
+        req_limit_item = {
+            "key": "requested_vs_limit",
+            "label": "Requested Loan vs. Eligibility Limit",
+            "status": "pending",
+            "actual": "Not requested yet",
+            "required": (f"≤ ₹{int(preliminary_limit):,}" if salary > 0 else "Salary limit missing"),
+            "reason": "No loan amount has been submitted for underwriting comparison yet.",
+        }
+
+        tenure_item = {
+            "key": "applicable_tenure",
+            "label": "Applicable Loan Tenure (48–72 mo)",
+            "status": "pending",
+            "actual": (f"Band default: {rec_tenure} mo" if salary > 0 else "Pending salary"),
+            "required": "48–72 months",
+            "reason": (
+                f"Default tenure based on salary band is {rec_tenure} months; final tenure is evaluated upon submission."
+                if salary > 0
+                else "Salary is missing; tenure band cannot be assigned yet."
+            ),
+        }
+
+    checklist = [age_item, cibil_item, limit_item, foir_item, req_limit_item, tenure_item]
+
+    passed_list = [item["reason"] for item in checklist if item["status"] == "passed"]
+    failed_list = [item["reason"] for item in checklist if item["status"] == "failed"]
+    pending_list = [item["reason"] for item in checklist if item["status"] == "pending"]
+
+    # Determine overall status & "Why this result?" narrative
+    has_missing_core = any(
+        item["key"] in ("age_requirement", "minimum_cibil", "salary_preliminary_limit") and item["status"] == "pending"
+        for item in checklist
+    )
+
+    if last_uw and last_uw.get("status") == "Approved":
+        overall_status = "Final Approved"
+        overall_tone = "approved"
+        why_headline = "Final Loan Approval Granted"
+        why_summary = (
+            f"Your requested loan of ₹{int(req_amt):,} passed all underwriting rules "
+            f"(Age {age}, CIBIL {credit}, within ₹{int(preliminary_limit):,} limit, {eval_foir:.1f}% FOIR ≤ 50%)."
+        )
+    elif failed_list:
+        overall_status = "Not Eligible"
+        overall_tone = "rejected"
+        why_headline = "Eligibility Criteria Not Met"
+        if salary > 0 and credit > 0 and credit < 700:
+            why_summary = (
+                f"Your salary-based preliminary limit is ₹{int(preliminary_limit):,}. "
+                f"However, your CIBIL score is {credit}, below the configured minimum of 700. "
+                "Therefore, you currently fail the credit-score criterion and cannot obtain final approval."
+            )
+        else:
+            why_summary = " ".join(failed_list)
+    elif has_missing_core:
+        overall_status = "Incomplete Profile"
+        overall_tone = "pending"
+        why_headline = "Profile Incomplete — Cannot Evaluate Fully"
+        why_summary = "One or more mandatory customer attributes (age, CIBIL score, or monthly salary) are missing and must be provided before eligibility can be finalized."
+    elif req_amt is None:
+        overall_status = "Preliminary Eligible"
+        overall_tone = "preapproved"
+        why_headline = "Baseline Criteria Passed — Ready to Apply"
+        why_summary = (
+            f"You meet all baseline profile checks (Age {age} yrs, CIBIL {credit} ≥ 700) with a "
+            f"salary-based preliminary limit of ₹{int(preliminary_limit):,} and ₹{int(max_affordable_emi):,}/month remaining EMI capacity. "
+            "Submit a loan amount below or in chat to run final underwriting."
+        )
+    else:
+        overall_status = "Eligible"
+        overall_tone = "approved"
+        why_headline = "All Underwriting Checks Passed"
+        why_summary = f"All criteria passed for ₹{int(req_amt):,} at {eval_foir:.1f}% FOIR."
+
+    return {
+        "verified": True,
+        "requires_kyc": False,
+        "customer": {
+            "customer_id": verified_cust.get("customer_id"),
+            "name": verified_cust.get("name", "Customer"),
+            "salary": salary,
+            "credit_score": credit,
+            "age": age,
+            "existing_emi": existing_emi,
+            "preliminary_limit": preliminary_limit,
+            "max_foir_budget": max_foir_budget,
+            "max_affordable_emi": max_affordable_emi,
+            "recommended_tenure": rec_tenure,
+            "requested_loan_amount": req_amt,
+            "requested_tenure": req_tenure,
+            "overall_status": overall_status,
+            "overall_tone": overall_tone,
+            "application_status": assessment["application_status"],
+            "sanction": verified_cust.get("sanction"),
+        },
+        "credit_score_card": {
+            "score": credit if credit and credit > 0 else None,
+            "min_required": 700,
+            "min_scale": 300,
+            "max_scale": 900,
+            "status": cibil_status,
+            "explanation": cibil_reason,
+        },
+        "checklist": checklist,
+        "why_this_result": {
+            "headline": why_headline,
+            "summary": why_summary,
+            "passed_conditions": passed_list,
+            "failed_conditions": failed_list,
+            "pending_conditions": pending_list,
+            "preliminary_vs_final_note": (
+                "Preliminary eligibility (15× monthly net salary) only estimates borrowing capacity and is not final approval. "
+                "Final loan approval requires passing Age (21–65), CIBIL (≥ 700), Limit (≤ 15× salary), Tenure (48–72 months), and FOIR (≤ 50%) in Python underwriting."
+            ),
+        },
+        "system_config": {
+            "min_cibil": 700,
+            "max_cibil": 900,
+            "min_cibil_scale": 300,
+            "min_age": 21,
+            "max_age": 65,
+            "salary_multiplier": 15,
+            "max_foir_pct": 50.0,
+            "allowed_tenures": [48, 60, 72],
+            "interest_rate_pa": SYSTEM_INTEREST_RATE,
+        },
+    }
+
+
+def simulate_loan_for_verified_customer(session_id, loan_amount, tenure_months=None, interest_rate=None):
+    """
+    Read-only backend EMI & FOIR simulator using calculate_emi() and verified session profile.
+    Never modifies customer records or initiates underwriting.
+    """
+    verified_cust, assessment = get_verified_customer_context(session_id, refresh_from_firebase=False)
+    if not verified_cust or not assessment:
+        return {"verified": False, "requires_kyc": True, "message": "Please complete KYC verification first."}, 200
+
+    amt = parse_loan_amount_text(loan_amount)
+    if amt is None or amt <= 0 or amt > 1_000_000_000:
+        return {"verified": True, "error": "Please enter a valid positive loan amount (up to ₹1,00,00,00,000)."}, 400
+
+    try:
+        tenure = int(tenure_months) if tenure_months is not None else assessment["recommended_tenure"]
+    except (TypeError, ValueError):
+        return {"verified": True, "error": "Tenure must be a valid integer in months (48, 60, or 72)."}, 400
+    if tenure < 12 or tenure > 120:
+        return {"verified": True, "error": "Simulator tenure must be between 12 and 120 months (system underwriting supports 48–72 months)."}, 400
+
+    try:
+        rate = float(interest_rate) if interest_rate is not None else SYSTEM_INTEREST_RATE
+    except (TypeError, ValueError):
+        return {"verified": True, "error": "Interest rate must be a valid number."}, 400
+    if rate < 0 or rate > 50:
+        return {"verified": True, "error": "Interest rate must be between 0% and 50% p.a."}, 400
+
+    salary = assessment["salary"]
+    existing_emi = assessment["existing_emi"]
+    preliminary_limit = assessment["preliminary_limit"]
+    max_foir_budget = assessment["max_foir_budget"]
+
+    emi = calculate_emi(amt, rate, tenure) or 0.0
+    total_repayment = emi * tenure
+    total_interest = max(0.0, total_repayment - amt)
+    total_monthly_emi = existing_emi + emi
+    foir_pct = (total_monthly_emi / salary) * 100.0 if salary > 0 else 100.0
+
+    within_limit = (salary > 0) and (amt <= preliminary_limit)
+    within_foir = (salary > 0) and (round(foir_pct, 2) <= 50.00) and (total_monthly_emi <= (max_foir_budget + 0.01))
+    within_tenure_policy = 48 <= tenure <= 72
+
+    if salary <= 0:
+        affordability_status = "Salary Missing"
+        affordability_tone = "pending"
+    elif within_foir and within_limit and within_tenure_policy and assessment["eligible_for_final"]:
+        affordability_status = "Affordable & Eligible"
+        affordability_tone = "approved"
+    elif within_foir and within_limit:
+        affordability_status = "Affordable EMI (Profile/Policy Check Pending or Blocked)"
+        affordability_tone = "preapproved"
+    elif not within_limit:
+        affordability_status = "Exceeds 15× Salary Limit"
+        affordability_tone = "rejected"
+    else:
+        affordability_status = "Exceeds 50% FOIR Limit"
+        affordability_tone = "rejected"
+
+    return {
+        "verified": True,
+        "simulation_only": True,
+        "inputs": {
+            "loan_amount": amt,
+            "tenure_months": tenure,
+            "interest_rate_pa": rate,
+        },
+        "results": {
+            "monthly_emi": round(emi, 2),
+            "monthly_emi_rounded": int(round(emi)),
+            "total_interest": round(total_interest, 2),
+            "total_interest_rounded": int(round(total_interest)),
+            "total_repayment": round(total_repayment, 2),
+            "total_repayment_rounded": int(round(total_repayment)),
+            "existing_emi": existing_emi,
+            "total_monthly_emi": round(total_monthly_emi, 2),
+            "foir_pct": round(foir_pct, 1),
+            "within_foir": within_foir,
+            "within_salary_limit": within_limit,
+            "within_tenure_policy": within_tenure_policy,
+            "affordability_status": affordability_status,
+            "affordability_tone": affordability_tone,
+            "uses_custom_rate": abs(rate - SYSTEM_INTEREST_RATE) > 0.001,
+            "system_interest_rate_pa": SYSTEM_INTEREST_RATE,
+        },
+    }, 200
+
+
 def get_verified_customer_context(session_id, refresh_from_firebase=True):
     """
     Retrieve the session-bound verified customer record and deterministic eligibility summary.
@@ -1793,6 +2243,10 @@ def chat():
     is_logout = is_logout_phrase(user_input)
     is_profile_query = is_profile_lookup_query(user_input)
     is_emi_query = is_emi_calculation_query(user_input)
+    is_dashboard_request = (not onboarding_state) and any(p in t_lower for p in [
+        "view my eligibility dashboard", "open eligibility dashboard", "show eligibility dashboard",
+        "show my eligibility dashboard", "open my eligibility dashboard", "eligibility dashboard"
+    ])
 
     # Keep personal verified-customer follow-ups conversational (Gemini + context-aware fallback)
     is_personal_followup = bool(
@@ -1837,6 +2291,7 @@ def chat():
         or is_onboarding_field_reply
         or is_onboarding_trigger
         or is_logout
+        or is_dashboard_request
         or is_profile_query
         or is_emi_query
         or is_structured_faq
@@ -1876,7 +2331,20 @@ def chat():
         init_error=LLM_INIT_ERROR,
     )
 
-    if should_use_local_rules:
+    if is_dashboard_request:
+        if verified_cust:
+            text = (
+                f"Opening your **Loan Eligibility Dashboard** for **{verified_cust.get('name', 'Customer')}** "
+                f"(`{verified_cust.get('customer_id')}`)."
+            )
+        else:
+            text = (
+                "Please complete **KYC verification** first by entering your Customer ID "
+                "(e.g., `cust01` or `cust99`) or typing `'I am a new customer'` before opening your personal dashboard."
+            )
+        engine_category = "local_rules"
+        model_used = "local_master_agent"
+    elif should_use_local_rules:
         text = local_master_agent(session_id, user_input)
         # If an FAQ/EMI interrupted onboarding, remind the pending step cleanly while preserving state
         if onboarding_state and (is_structured_faq or is_emi_query) and sess.get("onboarding_state"):
@@ -2010,6 +2478,7 @@ def chat():
     return jsonify({
         "response_text": text,
         "orchestration_command": None,
+        "open_eligibility_dashboard": bool(is_dashboard_request),
         "monitoring": snapshot,
     })
 
@@ -2088,6 +2557,22 @@ def orchestrate():
 
         result = underwrite(c, amt_raw, tenure=parsed_tenure)
 
+        # Record requested loan details on active verified session only (never mutates customer DB record)
+        try:
+            clean_req_amt = parse_loan_amount_text(amt_raw)
+        except Exception:
+            clean_req_amt = None
+        if clean_req_amt and clean_req_amt > 0:
+            c["last_requested_amount"] = clean_req_amt
+        c["last_requested_tenure"] = result.get("tenure_months") or parsed_tenure
+        c["last_underwriting_result"] = {
+            "status": result.get("status"),
+            "emi": result.get("emi"),
+            "foir": result.get("foir"),
+            "failed_conditions": result.get("failed_conditions", []),
+        }
+        c["profile_assessment"] = evaluate_customer_profile_eligibility(c)
+
         if result["status"] in ("Pre-Approved", "Approval", "Approved"):
             tenure = result.get("tenure_months")
             try:
@@ -2150,6 +2635,31 @@ def new_chat():
 @app.route("/")
 def index():
     return render_template("chat.html")
+
+
+@app.route("/api/eligibility-dashboard", methods=["GET"])
+def api_eligibility_dashboard():
+    """Return verified customer Loan Eligibility Dashboard payload from authoritative Python rules."""
+    session_id = request.args.get("session_id")
+    payload = build_eligibility_dashboard_payload(session_id, refresh_from_firebase=True)
+    return jsonify(payload)
+
+
+@app.route("/api/eligibility-simulate", methods=["POST"])
+def api_eligibility_simulate():
+    """Read-only EMI & FOIR simulator backed by Python calculate_emi()."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    loan_amount = data.get("loan_amount")
+    tenure_months = data.get("tenure_months")
+    interest_rate = data.get("interest_rate")
+    payload, status_code = simulate_loan_for_verified_customer(
+        session_id=session_id,
+        loan_amount=loan_amount,
+        tenure_months=tenure_months,
+        interest_rate=interest_rate,
+    )
+    return jsonify(payload), status_code
 
 
 @app.route("/api/monitoring")

@@ -1625,6 +1625,204 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
                 main_app.monitoring_store = orig_store
                 main_app.llm = orig_llm
 
+    # ────────────────────────────────────────────────────────────────
+    # 13. Interactive Loan Eligibility Dashboard & Simulator Tests
+    # ────────────────────────────────────────────────────────────────
+    def test_66_eligibility_dashboard_requires_kyc_when_unverified(self):
+        """Scenario 4: Unverified session returns requires_kyc=True and no fabricated customer data."""
+        resp = self.client.get("/api/eligibility-dashboard?session_id=sess_unverified_dash")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertFalse(data["verified"])
+        self.assertTrue(data["requires_kyc"])
+        self.assertIn("kyc", data["message"].lower())
+        self.assertNotIn("customer", data)
+
+        # Simulator endpoint also blocks unverified access cleanly
+        sim = self.client.post("/api/eligibility-simulate", json={
+            "session_id": "sess_unverified_dash",
+            "loan_amount": 300000,
+            "tenure_months": 60,
+            "interest_rate": 12.0,
+        }).get_json()
+        self.assertFalse(sim["verified"])
+        self.assertTrue(sim["requires_kyc"])
+
+    def test_67_eligibility_dashboard_good_score_cust01_before_and_after_underwrite(self):
+        """Scenario 1: Verified cust01 (810) shows passed baseline, pending unrequested items, then passed after submit."""
+        sess_id = "sess_dash_cust01"
+        main_app.session_data.pop(sess_id, None)
+        self.client.post("/orchestrate", json={
+            "step": "VERIFY_KYC",
+            "session_id": sess_id,
+            "customer_info": {"customer_id": "cust01"},
+        })
+
+        d1 = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+        self.assertTrue(d1["verified"])
+        self.assertEqual(d1["customer"]["customer_id"], "cust01")
+        self.assertEqual(d1["customer"]["credit_score"], 810)
+        self.assertEqual(d1["customer"]["overall_status"], "Preliminary Eligible")
+        self.assertEqual(d1["credit_score_card"]["status"], "passed")
+        self.assertIsNone(d1["customer"]["requested_loan_amount"])
+
+        # Checklist states before explicit loan request: baseline passed, request-dependent items strictly pending
+        by_key = {item["key"]: item for item in d1["checklist"]}
+        self.assertEqual(by_key["age_requirement"]["status"], "passed")
+        self.assertEqual(by_key["minimum_cibil"]["status"], "passed")
+        self.assertEqual(by_key["salary_preliminary_limit"]["status"], "passed")
+        self.assertEqual(by_key["foir_affordability"]["status"], "pending")
+        self.assertEqual(by_key["requested_vs_limit"]["status"], "pending")
+        self.assertEqual(by_key["applicable_tenure"]["status"], "pending")
+
+        # Explicit Submit for Underwriting updates requested amount & checklist statuses
+        self.client.post("/orchestrate", json={
+            "step": "UNDERWRITE",
+            "session_id": sess_id,
+            "customer_info": {"loan_amount": 500000, "tenure": 60},
+        })
+        d2 = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+        self.assertEqual(d2["customer"]["overall_status"], "Final Approved")
+        self.assertEqual(d2["customer"]["requested_loan_amount"], 500000.0)
+        by_key2 = {item["key"]: item for item in d2["checklist"]}
+        self.assertEqual(by_key2["foir_affordability"]["status"], "passed")
+        self.assertEqual(by_key2["requested_vs_limit"]["status"], "passed")
+        self.assertEqual(by_key2["applicable_tenure"]["status"], "passed")
+
+    def test_68_eligibility_dashboard_low_score_cust99_and_why_result(self):
+        """Scenario 2: Verified cust99 (580) shows failed CIBIL gauge, Not Eligible status, and accurate Why explanation."""
+        sess_id = "sess_dash_cust99"
+        main_app.session_data.pop(sess_id, None)
+        self.client.post("/orchestrate", json={
+            "step": "VERIFY_KYC",
+            "session_id": sess_id,
+            "customer_info": {"customer_id": "cust99"},
+        })
+
+        d = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+        self.assertTrue(d["verified"])
+        self.assertEqual(d["customer"]["credit_score"], 580)
+        self.assertEqual(d["customer"]["overall_status"], "Not Eligible")
+        self.assertEqual(d["credit_score_card"]["status"], "failed")
+        self.assertEqual(d["credit_score_card"]["score"], 580)
+
+        by_key = {item["key"]: item for item in d["checklist"]}
+        self.assertEqual(by_key["minimum_cibil"]["status"], "failed")
+        self.assertIn("700", by_key["minimum_cibil"]["reason"])
+        self.assertEqual(by_key["salary_preliminary_limit"]["status"], "passed")
+        self.assertIn("580", d["why_this_result"]["summary"])
+        self.assertIn("700", d["why_this_result"]["summary"])
+        self.assertGreaterEqual(len(d["why_this_result"]["failed_conditions"]), 1)
+
+    def test_69_eligibility_dashboard_incomplete_profile_never_marks_missing_as_passed(self):
+        """Scenario 3: Verified session with missing age/salary/CIBIL marks missing criteria strictly as 'pending'."""
+        sess_id = "sess_dash_incomplete"
+        main_app.session_data[sess_id] = {
+            "customer_id": "cust_incomplete_demo",
+            "name": "Partial User",
+            "verified": True,
+            "status": "Verification Successful",
+            "salary": 0,
+            "credit_score": 0,
+            "age": 0,
+            "current_loan_status": "0",
+        }
+        try:
+            d = self.client.get(f"/api/eligibility-dashboard?session_id={sess_id}").get_json()
+            self.assertTrue(d["verified"])
+            self.assertEqual(d["customer"]["overall_status"], "Incomplete Profile")
+            self.assertIsNone(d["credit_score_card"]["score"])
+            self.assertEqual(d["credit_score_card"]["status"], "pending")
+            for item in d["checklist"]:
+                self.assertEqual(item["status"], "pending", f"Expected pending for {item['key']}, got {item['status']}")
+        finally:
+            main_app.session_data.pop(sess_id, None)
+
+    def test_70_simulator_matches_backend_emi_foir_and_never_mutates_customer_or_triggers_underwriting(self):
+        """Scenario 5, 6, 9, 10: Simulator matches calculate_emi(), respects existing EMIs in FOIR, and is strictly read-only."""
+        sess_id = "sess_dash_sim"
+        main_app.session_data[sess_id] = {
+            "customer_id": "cust_sim_user",
+            "name": "Sim Tester",
+            "verified": True,
+            "status": "Verification Successful",
+            "salary": 50000,
+            "credit_score": 760,
+            "age": 30,
+            "pre_approved_limit": 750000,
+            "current_loan_status": "15000",  # Existing EMI = 15,000 (50% FOIR limit = 25,000)
+        }
+        try:
+            snapshot_before = json.loads(json.dumps(main_app.session_data[sess_id]))
+
+            # Test multiple tenures (48, 60, 72) and amounts
+            for amt, ten in [(300000, 48), (400000, 60), (600000, 72)]:
+                resp = self.client.post("/api/eligibility-simulate", json={
+                    "session_id": sess_id,
+                    "loan_amount": amt,
+                    "tenure_months": ten,
+                    "interest_rate": 12.0,
+                })
+                self.assertEqual(resp.status_code, 200)
+                sim = resp.get_json()
+                res = sim["results"]
+
+                expected_emi = calculate_emi(amt, 12.0, ten)
+                expected_foir = round(((15000 + expected_emi) / 50000) * 100.0, 1)
+
+                self.assertAlmostEqual(res["monthly_emi"], round(expected_emi, 2), places=2)
+                self.assertAlmostEqual(res["foir_pct"], expected_foir, places=1)
+                self.assertEqual(res["within_foir"], expected_foir <= 50.0)
+
+            # High loan exceeding 15x limit -> flagged cleanly
+            over_limit = self.client.post("/api/eligibility-simulate", json={
+                "session_id": sess_id,
+                "loan_amount": 900000,
+                "tenure_months": 60,
+                "interest_rate": 12.0,
+            }).get_json()
+            self.assertFalse(over_limit["results"]["within_salary_limit"])
+
+            # Invalid amount rejected cleanly with 400
+            bad_resp = self.client.post("/api/eligibility-simulate", json={
+                "session_id": sess_id,
+                "loan_amount": -500,
+                "tenure_months": 60,
+                "interest_rate": 12.0,
+            })
+            self.assertEqual(bad_resp.status_code, 400)
+
+            # Confirm customer record and underwriting state remained completely untouched
+            self.assertEqual(main_app.session_data[sess_id], snapshot_before)
+            self.assertNotIn("last_requested_amount", main_app.session_data[sess_id])
+            self.assertNotIn("last_underwriting_result", main_app.session_data[sess_id])
+        finally:
+            main_app.session_data.pop(sess_id, None)
+
+    def test_71_chat_command_opens_eligibility_dashboard(self):
+        """Typing 'View My Eligibility Dashboard' in chat returns open_eligibility_dashboard=True without LLM."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                sess_id = "sess_open_dash_cmd"
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust01"},
+                })
+                r = self.client.post("/chat", json={
+                    "session_id": sess_id,
+                    "user_input": "View My Eligibility Dashboard",
+                }).get_json()
+                self.assertTrue(r.get("open_eligibility_dashboard"))
+                self.assertIsNone(r.get("orchestration_command"))
+                self.assertIn("Ramesh S.", r["response_text"])
+            finally:
+                main_app.monitoring_store = orig_store
+
 
 if __name__ == "__main__":
     unittest.main()
