@@ -471,15 +471,28 @@ async function handleOrchestration(cmd, user_text, chatData = null) {
                 currentSessionTitle = newTitle;
 
                 const prelimLimit = Number(c.pre_approved_limit || c.salary * 15).toLocaleString('en-IN');
+                const assessment = c.profile_assessment || {};
+                const isEligibleForFinal = assessment.eligible_for_final !== undefined
+                    ? Boolean(assessment.eligible_for_final)
+                    : (Number(c.credit_score || 0) >= 700);
+                const failedList = Array.isArray(assessment.failed_criteria) ? assessment.failed_criteria : [];
+
+                const badgeHtml = isEligibleForFinal
+                    ? `<span class="status-badge preapproved">Preliminary Eligible</span>`
+                    : `<span class="status-badge rejected">Not Eligible for Final Approval</span>`;
+
+                const nextStepHtml = isEligibleForFinal
+                    ? `<small style="color:var(--text-muted);display:block;line-height:1.45;">This is an initial eligibility estimate based on your monthly net salary (15x salary). Final loan approval is subject to CIBIL verification, age eligibility, FOIR calculation, document verification and the lender's final assessment.</small><br>How much loan amount would you like to apply for (up to ₹${prelimLimit})?`
+                    : `<small style="color:var(--text-muted);display:block;line-height:1.45;"><strong>Important Distinction:</strong> While ₹${prelimLimit} reflects your 15× salary-based preliminary limit, you currently do <strong>not</strong> meet mandatory approval requirements: ${failedList.length ? failedList.join(" ") : `CIBIL score (${c.credit_score}) is below the configured minimum of 700.`}</small><br>Ask any question about your eligibility or profile (e.g., <em>"Am I eligible for a loan?"</em> or <em>"How can I improve my eligibility?"</em>).`;
+
                 const cardHtml = `
                     <strong>KYC Verification Successful</strong><br>
                     • Customer Name: <strong>${c.name}</strong><br>
                     • Credit Score: <strong>${c.credit_score}</strong><br>
                     • Monthly Salary: <strong>₹${Number(c.salary).toLocaleString('en-IN')}</strong><br>
-                    • Preliminary Loan Eligibility: <strong>Up to ₹${prelimLimit}</strong><br>
-                    • Application Status: <span class="status-badge preapproved">Preliminary Eligible</span><br><br>
-                    <small style="color:var(--text-muted);display:block;line-height:1.45;">This is an initial eligibility estimate based on your monthly net salary (15x salary). Final loan approval is subject to CIBIL verification, age eligibility, FOIR calculation, document verification and the lender's final assessment.</small><br>
-                    How much loan amount would you like to apply for (up to ₹${prelimLimit})?
+                    • Salary-Based Preliminary Limit (15×): <strong>Up to ₹${prelimLimit}</strong><br>
+                    • Application Status: ${badgeHtml}<br><br>
+                    ${nextStepHtml}
                 `;
                 addMessage(cardHtml, "assistant", false);
                 updateSessionRecord(null, newTitle);
@@ -727,21 +740,27 @@ function formatMessage(text) {
         .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
         .replace(/(^|[\s(>])\*([^*\n]+?)\*(?=[\s.,!?;:)<]|$)/g, "$1<em>$2</em>");
 
-    // Single-pass replacement for status chips (prevents recursive tag nesting)
-    formatted = formatted.replace(/\b(Preliminary Eligible|Under Review|Final Approved|Pre-Approved|Approved|Verification Successful|KYC Verified|Rejected|Rejection)\b/gi, (match) => {
-        const lower = match.toLowerCase();
-        if (lower === "preliminary eligible" || lower === "pre-approved") {
-            return `<span class="status-badge preapproved">Preliminary Eligible</span>`;
-        } else if (lower === "under review") {
-            return `<span class="status-badge review">Under Review</span>`;
-        } else if (lower === "final approved" || lower === "approved") {
-            return `<span class="status-badge approved">Final Approved</span>`;
-        } else if (lower.includes("reject")) {
-            return `<span class="status-badge rejected">Rejected</span>`;
-        } else {
-            return `<span class="status-badge verified">${match}</span>`;
+    // Single-pass replacement on non-HTML-tag segments only (prevents corrupting class="status-badge rejected" attributes)
+    const statusRe = /\b(Preliminary Eligible|Under Review|Final Approved|Pre-Approved|Approved|Verification Successful|KYC Verified|Rejected|Rejection)\b/gi;
+    formatted = formatted.split(/(<[^>]+>)/g).map((part) => {
+        if (part.startsWith("<") && part.endsWith(">")) {
+            return part;
         }
-    });
+        return part.replace(statusRe, (match) => {
+            const lower = match.toLowerCase();
+            if (lower === "preliminary eligible" || lower === "pre-approved") {
+                return `<span class="status-badge preapproved">Preliminary Eligible</span>`;
+            } else if (lower === "under review") {
+                return `<span class="status-badge review">Under Review</span>`;
+            } else if (lower === "final approved" || lower === "approved") {
+                return `<span class="status-badge approved">Final Approved</span>`;
+            } else if (lower.includes("reject")) {
+                return `<span class="status-badge rejected">Rejected</span>`;
+            } else {
+                return `<span class="status-badge verified">${match}</span>`;
+            }
+        });
+    }).join("");
 
     return formatted;
 }

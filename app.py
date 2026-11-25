@@ -968,13 +968,245 @@ def append_onboarding_reminder(reply_text, onboarding_state):
     return f"{reply_text.rstrip()}\n\n---\n📌 **To continue your registration:** {reminder}"
 
 
+def evaluate_customer_profile_eligibility(customer):
+    """
+    Deterministic Python evaluation of a verified customer's profile against underwriting thresholds.
+    Clearly separates salary-based preliminary limit (15x) from actual underwriting eligibility.
+    """
+    if not isinstance(customer, dict):
+        return None
+
+    salary = float(customer.get("salary", 0) or 0)
+    credit = int(customer.get("credit_score", 0) or 0)
+
+    dob_raw = customer.get("dob")
+    age_calc = calculate_age_from_dob(dob_raw) if dob_raw else None
+    if age_calc is not None:
+        age = age_calc
+    else:
+        try:
+            age = int(customer.get("age", 0) or 0)
+        except (TypeError, ValueError):
+            age = 0
+
+    curr_loan_raw = customer.get("current_loan_status") or customer.get("currentloan") or 0
+    try:
+        if isinstance(curr_loan_raw, str):
+            clean_curr = re.sub(r"[^\d.]", "", curr_loan_raw)
+            existing_emi = float(clean_curr) if clean_curr else 0.0
+        else:
+            existing_emi = float(curr_loan_raw)
+    except (TypeError, ValueError):
+        existing_emi = 0.0
+
+    preliminary_limit = float(customer.get("pre_approved_limit") or calculate_preapproved_limit_from_salary(salary))
+    max_foir_budget = salary * 0.50
+    max_affordable_emi = max(0.0, max_foir_budget - existing_emi)
+    recommended_tenure = determine_tenure_months(salary)
+
+    failed_criteria = []
+    if age < 21 or age > 65:
+        failed_criteria.append(f"Age ({age} years) is outside the required 21–65 years range.")
+    if credit < 700:
+        failed_criteria.append(f"CIBIL credit score ({credit}) is below the configured minimum threshold of 700.")
+    if salary <= 0:
+        failed_criteria.append("Monthly net salary must be greater than ₹0.")
+    elif existing_emi > max_foir_budget + 0.01:
+        foir_pct = (existing_emi / salary) * 100.0
+        failed_criteria.append(
+            f"Existing monthly EMIs (₹{int(existing_emi):,}, {foir_pct:.1f}% FOIR) exceed the 50% affordability cap."
+        )
+
+    eligible_for_final = len(failed_criteria) == 0
+    if customer.get("sanction"):
+        app_status = "Final Approved (Sanction Letter Issued)"
+    elif eligible_for_final:
+        app_status = "Preliminary Eligible (Pending Loan Amount & Final Underwriting)"
+    else:
+        app_status = "Preliminary Limit Calculated — Not Eligible for Final Approval"
+
+    return {
+        "salary": salary,
+        "credit_score": credit,
+        "age": age,
+        "existing_emi": existing_emi,
+        "preliminary_limit": preliminary_limit,
+        "max_foir_budget": max_foir_budget,
+        "max_affordable_emi": max_affordable_emi,
+        "recommended_tenure": recommended_tenure,
+        "failed_criteria": failed_criteria,
+        "eligible_for_final": eligible_for_final,
+        "application_status": app_status,
+    }
+
+
+def get_verified_customer_context(session_id, refresh_from_firebase=True):
+    """
+    Retrieve the session-bound verified customer record and deterministic eligibility summary.
+    Refreshes from Firebase RTDB when configured so Firebase remains the source of truth.
+    Returns (customer_dict, assessment_dict) or (None, None) if session is unverified.
+    """
+    sess = session_data.get(session_id)
+    if not isinstance(sess, dict):
+        return None, None
+    cid = sess.get("customer_id")
+    if not cid:
+        return None, None
+    if not (sess.get("verified") or sess.get("status") == "Verification Successful"):
+        return None, None
+
+    if refresh_from_firebase and FIREBASE_DB_URL:
+        live_fb = get_customer_from_firebase(cid.lower().strip())
+        if live_fb:
+            # Preserve active session state flags (verified timestamp, sanction record)
+            sanction_state = sess.get("sanction")
+            verified_at = sess.get("verified_at")
+            live_fb["status"] = "Verification Successful"
+            live_fb["verified"] = True
+            if verified_at:
+                live_fb["verified_at"] = verified_at
+            if sanction_state:
+                live_fb["sanction"] = sanction_state
+            session_data[session_id] = live_fb
+            sess = live_fb
+
+    assessment = evaluate_customer_profile_eligibility(sess)
+    return sess, assessment
+
+
+def build_minimal_verified_context_prompt(customer, assessment):
+    """
+    Build a concise, read-only verified customer context block for Gemini index-0 SystemMessage.
+    Passes only minimum relevant financial/eligibility facts — omits PAN, phone, email, and other customers.
+    """
+    if not customer or not assessment:
+        return ""
+
+    failed_summary = (
+        "None (meets baseline profile rules; final approval still depends on requested loan amount <= 15x salary, tenure 48–72 months, and total FOIR <= 50%)"
+        if assessment["eligible_for_final"]
+        else " | ".join(assessment["failed_criteria"])
+    )
+    sanction_info = customer.get("sanction")
+    sanction_note = f"Yes ({sanction_info.get('pdf')})" if isinstance(sanction_info, dict) and sanction_info.get("pdf") else "No"
+
+    return (
+        "\n\nCURRENT VERIFIED SESSION CUSTOMER CONTEXT (session-bound, authenticated via KYC — use these exact figures when answering personal questions; do NOT ask the user to re-enter info shown below, do NOT reveal internal field names, and do NOT treat salary-based preliminary limit as final approval if any criterion failed):\n"
+        f"- Customer ID: {customer.get('customer_id')}\n"
+        f"- Name: {customer.get('name', 'Customer')}\n"
+        f"- Monthly Net Salary: ₹{int(assessment['salary']):,}\n"
+        f"- Total 50% FOIR Monthly Debt Ceiling (50% of salary): ₹{int(assessment['max_foir_budget']):,}/month\n"
+        f"- Existing Monthly EMIs Already Committed: ₹{int(assessment['existing_emi']):,}/month\n"
+        f"- Remaining Affordable Additional Proposed EMI (Ceiling minus Existing EMIs — already calculated; do NOT subtract existing EMIs again): ₹{int(assessment['max_affordable_emi']):,}/month\n"
+        f"- Verified CIBIL / Credit Score: {assessment['credit_score']} (system minimum threshold: 700; scale: 300–900)\n"
+        f"- Age: {assessment['age']} years (system range: 21–65)\n"
+        f"- Salary-Based Preliminary Limit (15x salary): ₹{int(assessment['preliminary_limit']):,}\n"
+        f"- Recommended Tenure Band: {assessment['recommended_tenure']} months @ 12% p.a.\n"
+        f"- Current Application Status: {assessment['application_status']}\n"
+        f"- Eligibility Check Result: {'MEETS BASELINE CRITERIA' if assessment['eligible_for_final'] else 'NOT ELIGIBLE FOR FINAL APPROVAL — Failed: ' + failed_summary}\n"
+        f"- Sanction Letter Issued: {sanction_note}\n"
+    )
+
+
 def safe_local_informational_fallback(session_id, text):
     """
     Deterministic safe responder used ONLY when Gemini is unavailable or fails.
-    Never modifies onboarding state, never fabricates defaults, never triggers underwriting.
+    Uses verified session customer context when available; never modifies onboarding state,
+    never fabricates defaults, never triggers underwriting, and never leaks other customers.
     """
     t = (text or "").lower().strip()
     sess = session_data.get(session_id, {})
+    verified_cust, assessment = get_verified_customer_context(session_id, refresh_from_firebase=False)
+
+    # ── Verified Customer Personal Follow-up Handling (Local Fallback Parity) ──
+    if verified_cust and assessment and not sess.get("onboarding_state"):
+        name = verified_cust.get("name", "Customer")
+        cid = verified_cust.get("customer_id")
+        sal = int(assessment["salary"])
+        score = assessment["credit_score"]
+        limit = int(assessment["preliminary_limit"])
+        max_emi = int(assessment["max_affordable_emi"])
+        existing_emi = int(assessment["existing_emi"])
+        failed = assessment["failed_criteria"]
+
+        # 1. "Am I eligible for a loan?" / "Why am I not eligible?"
+        if any(p in t for p in ["am i eligible", "not eligible", "why am i not", "eligible for a loan", "do i qualify", "can i get a loan", "eligibility"]):
+            if assessment["eligible_for_final"]:
+                return (
+                    f"Based on your verified profile (**{name}**, `{cid}`):\n\n"
+                    f"• **Monthly Net Salary**: ₹{sal:,}\n"
+                    f"• **Credit Score (CIBIL)**: **{score}** *(meets minimum 700)*\n"
+                    f"• **Preliminary Salary-Based Loan Limit (15×)**: **₹{limit:,}**\n"
+                    f"• **Max Affordable Monthly EMI (50% FOIR)**: **₹{max_emi:,}/month**\n\n"
+                    f"Your baseline profile meets our eligibility criteria (**Age 21–65**, **CIBIL ≥ 700**). "
+                    f"Note that final loan approval is only granted after you enter a specific loan amount and pass full underwriting (amount ≤ ₹{limit:,}, tenure 48–72 months, total FOIR ≤ 50%)."
+                )
+            reasons_text = "\n• ".join(failed)
+            return (
+                f"Based on your verified profile (`{cid}`), your **monthly net salary is ₹{sal:,}** and your **credit score is {score}**.\n\n"
+                f"• **Salary-Based Preliminary Limit (15×)**: ₹{limit:,} *(calculated strictly from salary)*\n"
+                f"• **Final Underwriting Eligibility**: **Not Eligible for Final Approval**\n\n"
+                f"**Reason(s):**\n• {reasons_text}\n\n"
+                f"While a salary-based preliminary limit of ₹{limit:,} is shown, it is not final loan approval—our system requires CIBIL ≥ 700, age 21–65, and FOIR ≤ 50%."
+            )
+
+        # 2. "What is my credit score?" / "What is my CIBIL?"
+        if any(p in t for p in ["my credit score", "my cibil", "what is my score", "credit score"]):
+            meets = "meets" if score >= 700 else "does **not** meet"
+            return (
+                f"Your verified **CIBIL / Credit Score** (`{cid}`) is **{score}** (on the 300–900 scale).\n\n"
+                f"• This {meets} our configured minimum threshold of **700** required for final loan approval."
+            )
+
+        # 3. "What is my maximum loan limit?"
+        if any(p in t for p in ["maximum loan", "max loan", "my limit", "loan limit"]):
+            status_clause = (
+                "You can submit a loan application up to this limit for final underwriting."
+                if assessment["eligible_for_final"]
+                else f"However, because **{' '.join(failed)}**, you are currently **not eligible for final loan approval** despite the salary-based preliminary limit."
+            )
+            return (
+                f"Based on your verified monthly salary of **₹{sal:,}**, your **salary-based preliminary maximum loan limit (15×)** is **₹{limit:,}**.\n\n"
+                f"{status_clause}"
+            )
+
+        # 4. "How much salary do I earn?"
+        if any(p in t for p in ["salary", "income", "earn"]):
+            return (
+                f"Your verified **Monthly Net Salary** on file (`{cid}`) is **₹{sal:,}** "
+                f"(giving a 15× salary-based preliminary limit of **₹{limit:,}** and a 50% FOIR monthly debt ceiling of **₹{int(assessment['max_foir_budget']):,}/month**)."
+            )
+
+        # 5. "What is my current application status?"
+        if any(p in t for p in ["application status", "current status", "my status"]):
+            extra = "" if assessment["eligible_for_final"] else f"\n• **Blocking Criterion**: {' '.join(failed)}"
+            return (
+                f"**Current Application Status (`{cid}`):** `{assessment['application_status']}`\n\n"
+                f"• **Salary-Based Preliminary Limit**: ₹{limit:,}\n"
+                f"• **Verified CIBIL Score**: {score}{extra}"
+            )
+
+        # 6. "How much EMI can I afford?"
+        if any(p in t for p in ["afford", "how much emi", "monthly emi"]):
+            return (
+                f"Under our **50% FOIR rule** on your verified monthly salary of **₹{sal:,}**:\n\n"
+                f"• **Total Monthly Debt Ceiling (50%)**: ₹{int(assessment['max_foir_budget']):,}/month\n"
+                f"• **Existing Monthly EMIs**: ₹{existing_emi:,}/month\n"
+                f"• **Maximum Affordable Proposed EMI**: **₹{max_emi:,}/month**"
+            )
+
+        # 7. "What can I do to improve my eligibility?"
+        if any(p in t for p in ["improve", "increase my", "how can i qualify", "become eligible"]):
+            tips = []
+            if score < 700:
+                tips.append(
+                    f"• **Improve Credit Score (currently {score} → need ≥ 700)**: Pay all credit card/loan EMIs on time, keep credit utilization below 30%, and avoid multiple hard credit inquiries."
+                )
+            if existing_emi > assessment["max_foir_budget"]:
+                tips.append("• **Reduce Existing Debt Obligations**: Pay down active EMIs so total FOIR stays at or below 50% of monthly net salary.")
+            if not tips:
+                tips.append("• Your profile already meets baseline CIBIL (≥ 700), Age (21–65), and FOIR capacity. Keeping your EMI under 50% of salary and choosing 48–72 month tenure keeps eligibility strong.")
+            return f"**Recommendations for your profile (`{cid}`):**\n\n" + "\n".join(tips)
 
     if any(w in t for w in ["700", "cibil", "credit score", "score"]):
         return (
@@ -1311,6 +1543,8 @@ def local_master_agent(session_id, text):
             new_customer["status"] = "Verification Successful"
 
             # Immediately link verified profile to active session
+            new_customer["verified"] = True
+            new_customer["verified_at"] = datetime.now(timezone.utc).isoformat()
             session_data[session_id] = new_customer.copy()
             sess["onboarding_state"] = None
             sess["onboarding_data"] = {}
@@ -1353,14 +1587,29 @@ def local_master_agent(session_id, text):
         )
 
     # ── 3. CUSTOMER ID VERIFICATION TRIGGER (custXXXX, excluding English 'customer') ──
-    if not is_general_question(text) and CUSTOMER_ID_REGEX.search(t):
-        return "[[FLASK_CALL:VERIFY_KYC]]"
+    cust_match = CUSTOMER_ID_REGEX.search(t)
+    if cust_match:
+        mentioned_cid = cust_match.group(0).lower()
+        verified_cust, _ = get_verified_customer_context(session_id, refresh_from_firebase=False)
+        if verified_cust and verified_cust.get("customer_id", "").lower() != mentioned_cid:
+            return (
+                f"You are currently verified as **{verified_cust.get('name')}** (`{verified_cust.get('customer_id')}`). "
+                f"For security, mentioning another Customer ID (`{mentioned_cid}`) in conversation cannot switch accounts or expose their details.\n\n"
+                "Please type **'logout'** first if you want to end this session and verify a different customer."
+            )
+        if not is_general_question(text):
+            return "[[FLASK_CALL:VERIFY_KYC]]"
+        return (
+            f"For security and privacy, you must verify KYC for **`{mentioned_cid}`** before accessing account details. "
+            f"Enter `{mentioned_cid}` directly to verify."
+        )
 
     # ── 4. LOGOUT / SWITCH CUSTOMER ──
     if is_logout_phrase(text):
         session_data[session_id] = {}
+        session_histories[session_id] = [SystemMessage(content=LLM_SYSTEM_PROMPT)]
         return (
-            "✅ **Logged out successfully.**\n\n"
+            "✅ **Logged out successfully.** Your verified customer context has been cleared.\n\n"
             "You can now:\n"
             "1. Enter an existing Customer ID (e.g. `cust01`, `cust10`)\n"
             "2. Type **'I am a new customer'** to register a new profile."
@@ -1368,30 +1617,42 @@ def local_master_agent(session_id, text):
 
     # ── 5. CHECK PROFILE / LIMIT / WHO AM I ──
     if is_profile_lookup_query(text):
-        if sess.get("customer_id"):
-            name = sess.get("name", "Customer")
-            cid = sess.get("customer_id")
-            salary = sess.get("salary", 0)
-            credit = sess.get("credit_score", 0)
-            limit = sess.get("pre_approved_limit") or salary * 15
-            email = sess.get("email", "Not provided")
-            tenure = determine_tenure_months(salary)
+        verified_cust, assessment = get_verified_customer_context(session_id, refresh_from_firebase=True)
+        if verified_cust and assessment:
+            name = verified_cust.get("name", "Customer")
+            cid = verified_cust.get("customer_id")
+            salary = int(assessment["salary"])
+            credit = assessment["credit_score"]
+            limit = int(assessment["preliminary_limit"])
+            email = verified_cust.get("email", "Not provided")
+            tenure = assessment["recommended_tenure"]
+            status_badge_val = "Preliminary Eligible" if assessment["eligible_for_final"] else "Not Eligible for Final Approval"
+            blocking_note = (
+                ""
+                if assessment["eligible_for_final"]
+                else "\n• **Eligibility Note**: " + " ".join(assessment["failed_criteria"])
+            )
+            next_step = (
+                f"Ready to apply? Simply enter the loan amount you wish to apply for (e.g. **₹{int(limit * 0.5):,}**)."
+                if assessment["eligible_for_final"]
+                else f"A salary-based preliminary limit of ₹{limit:,} does **not** grant final approval until the failed criteria above are satisfied."
+            )
             return (
-                f"👤 **Your Account Profile Details:**\n\n"
+                f"👤 **Your Verified Account Profile Details:**\n\n"
                 f"• **Name**: **{name}**\n"
                 f"• **Customer ID**: `{cid}`\n"
-                f"• **Monthly Salary**: ₹{int(salary):,}\n"
+                f"• **Monthly Salary**: ₹{salary:,}\n"
                 f"• **Credit Score**: {credit}\n"
-                f"• **Preliminary Loan Eligibility**: Up to **₹{int(limit):,}**\n"
-                f"• **Application Status**: `Preliminary Eligible`\n"
+                f"• **Salary-Based Preliminary Limit (15×)**: Up to **₹{limit:,}**\n"
+                f"• **Eligibility Status**: `{status_badge_val}`{blocking_note}\n"
                 f"• **Estimated Tenure**: {tenure} months @ 12% p.a.\n"
                 f"• **Registered Email**: `{email}`\n\n"
-                f"ℹ️ *This is an initial eligibility estimate based on your monthly net salary (15x salary). Final loan approval is subject to CIBIL verification, age eligibility, FOIR calculation, document verification and the lender's final assessment.*\n\n"
-                f"Ready to apply? Simply enter the loan amount you wish to apply for (e.g. **₹{int(limit * 0.5):,}**)."
+                f"ℹ️ *Salary-based preliminary limits are initial estimates only. Final approval requires passing CIBIL (≥700), Age (21–65), and FOIR (≤50%) underwriting checks.*\n\n"
+                f"{next_step}"
             )
         return (
             "You haven't verified a customer profile in this session yet.\n\n"
-            "• If you have an ID, enter it (e.g. `cust01` or your phone number).\n"
+            "• If you have an ID, enter it (e.g. `cust01` or `cust99`).\n"
             "• If you are new, type **'I am a new customer'** to register and check your limit!"
         )
 
@@ -1524,19 +1785,39 @@ def chat():
     onboarding_state = sess.get("onboarding_state")
     t_lower = user_input.lower().strip()
 
+    verified_cust, verified_assessment = get_verified_customer_context(session_id, refresh_from_firebase=True)
+
     is_question = is_general_question(user_input)
     is_cancel = bool(onboarding_state and is_onboarding_cancel_command(user_input))
     is_onboarding_trigger = (not onboarding_state) and is_onboarding_trigger_phrase(user_input)
     is_logout = is_logout_phrase(user_input)
     is_profile_query = is_profile_lookup_query(user_input)
     is_emi_query = is_emi_calculation_query(user_input)
-    is_structured_faq = is_structured_faq_query(user_input)
+
+    # Keep personal verified-customer follow-ups conversational (Gemini + context-aware fallback)
+    is_personal_followup = bool(
+        verified_cust
+        and (not onboarding_state)
+        and re.search(r"\b(?:i|my|me|am i|do i|can i)\b", t_lower)
+        and not is_profile_query
+        and not is_emi_query
+    )
+    is_structured_faq = is_structured_faq_query(user_input) and (not is_personal_followup)
     is_apply_intent = (not onboarding_state) and (not is_question) and any(p in t_lower for p in [
         "apply for a loan", "apply for loan", "apply loan", "want a loan", "want loan",
         "need a loan", "need loan", "take a loan", "take loan", "get a loan", "get loan",
         "i want to apply", "loan application", "how to apply"
     ])
-    is_cust_id = (not onboarding_state) and (not is_question) and bool(CUSTOMER_ID_REGEX.search(t_lower))
+
+    cust_id_match = CUSTOMER_ID_REGEX.search(t_lower) if (not onboarding_state) else None
+    is_cross_customer_attempt = bool(
+        cust_id_match
+        and (
+            (verified_cust and cust_id_match.group(0).lower() != verified_cust.get("customer_id", "").lower())
+            or ((not verified_cust) and is_question)
+        )
+    )
+    is_cust_id = bool(cust_id_match) and (not is_question) and (not is_cross_customer_attempt)
 
     extracted_loan_amount = None
     extracted_tenure = None
@@ -1560,6 +1841,7 @@ def chat():
         or is_emi_query
         or is_structured_faq
         or is_apply_intent
+        or is_cross_customer_attempt
         or is_cust_id
         or is_verified_and_amount
         or (loan_parse_status == "ambiguous_amount")
@@ -1610,21 +1892,24 @@ def chat():
         model_used = "local_master_agent"
         fallback_reason = LLM_INIT_ERROR or "Gemini API unavailable / not configured"
     else:
-        # Prepare Gemini message list; merge non-PII pending step context into index-0 SystemMessage
+        # Prepare Gemini message list; merge non-PII pending step & session-verified customer context into index-0 SystemMessage
         # (langchain-google-genai only allows SystemMessage at position 0, never mid-conversation)
         llm_messages = list(hist)
+        base_sys = llm_messages[0].content if llm_messages and isinstance(llm_messages[0], SystemMessage) else LLM_SYSTEM_PROMPT
+        extra_context_parts = []
         if onboarding_state:
             step_desc = ONBOARDING_CONTEXT_HINTS.get(onboarding_state, onboarding_state)
-            base_sys = llm_messages[0].content if llm_messages and isinstance(llm_messages[0], SystemMessage) else LLM_SYSTEM_PROMPT
-            merged_sys = SystemMessage(
-                content=(
-                    f"{base_sys}\n\n"
-                    f"CURRENT SESSION CONTEXT (mid-registration interruption): "
-                    f"The user paused onboarding at step '{onboarding_state}' ({step_desc}). "
-                    "Answer their informational question concisely and accurately, do NOT complete or reset registration, "
-                    "do NOT invent field values, and do NOT emit any [[FLASK_CALL:...]] tokens."
-                )
+            extra_context_parts.append(
+                f"\n\nCURRENT SESSION CONTEXT (mid-registration interruption): "
+                f"The user paused onboarding at step '{onboarding_state}' ({step_desc}). "
+                "Answer their informational question concisely and accurately, do NOT complete or reset registration, "
+                "do NOT invent field values, and do NOT emit any [[FLASK_CALL:...]] tokens."
             )
+        if verified_cust and verified_assessment and not onboarding_state:
+            extra_context_parts.append(build_minimal_verified_context_prompt(verified_cust, verified_assessment))
+
+        if extra_context_parts:
+            merged_sys = SystemMessage(content=f"{base_sys}{''.join(extra_context_parts)}")
             if llm_messages and isinstance(llm_messages[0], SystemMessage):
                 llm_messages = [merged_sys] + llm_messages[1:]
             else:
@@ -1744,11 +2029,42 @@ def orchestrate():
         if not cid:
             return jsonify({"status": "error", "message": "Customer ID is required", "next_step": "AWAITING_KYC"})
 
+        # Prevent silent session hijacking if session is already verified under a different Customer ID
+        existing_verified, _ = get_verified_customer_context(session_id, refresh_from_firebase=False)
+        if existing_verified and existing_verified.get("customer_id", "").lower() != cid:
+            return jsonify({
+                "status": "error",
+                "message": (
+                    f"Session is already verified for {existing_verified.get('customer_id')}. "
+                    "Please log out before verifying a different Customer ID."
+                ),
+                "next_step": "LOGOUT_REQUIRED",
+            })
+
         c = verify_kyc(cid)
         if c.get("status") == "Verification Successful":
+            c["verified"] = True
+            c["verified_at"] = datetime.now(timezone.utc).isoformat()
+            assessment = evaluate_customer_profile_eligibility(c)
+            c["profile_assessment"] = assessment
             session_data[session_id] = c.copy()
             save_session_meta(session_id, {"customer_name": c["name"], "email": c.get("email")})
-            return jsonify({"status": "success", "customer_data": c, "next_step": "ASK_LOAN_AMOUNT"})
+
+            # Record concise verification summary in conversation history for continuity
+            hist = get_session_history(session_id)
+            hist.append(AIMessage(
+                content=(
+                    f"KYC Verification Successful for {c.get('name')} ({cid}). "
+                    f"Salary: ₹{int(assessment['salary']):,}, CIBIL Score: {assessment['credit_score']}, "
+                    f"Salary-Based Preliminary Limit: ₹{int(assessment['preliminary_limit']):,}, "
+                    f"Status: {assessment['application_status']}."
+                )
+            ))
+            return jsonify({
+                "status": "success",
+                "customer_data": c,
+                "next_step": "ASK_LOAN_AMOUNT" if assessment["eligible_for_final"] else "INELIGIBLE_CIBIL_OR_PROFILE",
+            })
         return jsonify({"status": "error", "message": c.get("message", "Verification failed"), "next_step": "AWAITING_KYC"})
 
     if step == "UNDERWRITE":

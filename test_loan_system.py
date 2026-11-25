@@ -1404,6 +1404,227 @@ class LoanApprovalSystemTestSuite(unittest.TestCase):
                 main_app.monitoring_store = orig_store
                 main_app.llm = orig_llm
 
+    # ────────────────────────────────────────────────────────────────
+    # 12. Verified Customer Session Context & Memory Integrity Tests
+    # ────────────────────────────────────────────────────────────────
+    def test_62_cust99_followup_questions_use_verified_context_with_gemini(self):
+        """Scenarios 1–4: Verified cust99 passes minimal session context to Gemini & distinguishes limit vs CIBIL failure."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+
+                def fake_invoke(messages):
+                    sys_content = messages[0].content
+                    last_q = messages[-1].content.lower()
+                    # Verify minimal context was injected cleanly at index 0 and excludes PII (PAN/phone)
+                    self.assertIn("cust99", sys_content)
+                    self.assertIn("580", sys_content)
+                    self.assertIn("30,000", sys_content)
+                    self.assertIn("450,000", sys_content)
+                    self.assertIn("NOT ELIGIBLE FOR FINAL APPROVAL", sys_content)
+                    self.assertNotIn("LMNOP9012Q", sys_content)
+                    self.assertNotIn("7070707070", sys_content)
+                    self.assertNotIn("cust01", sys_content)
+
+                    if "credit score" in last_q:
+                        ans = "Your verified CIBIL credit score is 580, below the required minimum of 700."
+                    elif "maximum loan" in last_q:
+                        ans = "Your salary-based preliminary limit is ₹4,50,000, though CIBIL 580 currently blocks final approval."
+                    elif "why am i not" in last_q:
+                        ans = "Your credit score of 580 is below the 700 minimum threshold required here."
+                    else:
+                        ans = "Your salary is ₹30,000 (preliminary limit ₹4,50,000), but CIBIL 580 is below 700 so you are not eligible for final approval."
+
+                    return SimpleNamespace(
+                        content=ans,
+                        usage_metadata={"input_tokens": 160, "output_tokens": 28, "total_tokens": 188},
+                        response_metadata={},
+                    )
+
+                mock_llm.invoke.side_effect = fake_invoke
+                main_app.llm = mock_llm
+
+                sess_id = "sess_cust99_gemini"
+                main_app.session_data.pop(sess_id, None)
+                main_app.session_histories.pop(sess_id, None)
+
+                kyc_chat = self.client.post("/chat", json={"session_id": sess_id, "user_input": "cust99"}).get_json()
+                self.assertEqual(kyc_chat["orchestration_command"], "[[FLASK_CALL:VERIFY_KYC]]")
+
+                orch = self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust99"},
+                }).get_json()
+                self.assertEqual(orch["status"], "success")
+                self.assertFalse(orch["customer_data"]["profile_assessment"]["eligible_for_final"])
+
+                for q, expected in [
+                    ("Am I eligible for a loan?", "580"),
+                    ("What is my credit score?", "580"),
+                    ("What is my maximum loan limit?", "4,50,000"),
+                    ("Why am I not eligible?", "700"),
+                ]:
+                    r = self.client.post("/chat", json={"session_id": sess_id, "user_input": q}).get_json()
+                    self.assertIsNone(r.get("orchestration_command"))
+                    self.assertIn(expected, r["response_text"])
+                    self.assertEqual(r["monitoring"]["session"]["breakdown"]["gemini_primary"], mock_llm.invoke.call_count)
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_63_verified_customer_general_question_preserves_context_and_new_session_is_isolated(self):
+        """Scenarios 5 & 6: General questions preserve verified context; new sessions do not inherit old customer."""
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                mock_llm = MagicMock()
+                mock_llm.model = "models/gemini-3.5-flash-lite"
+                mock_llm.invoke.return_value = SimpleNamespace(
+                    content="Personal loans carry fixed 12% p.a. interest on reducing balance.",
+                    usage_metadata={"input_tokens": 100, "output_tokens": 16, "total_tokens": 116},
+                    response_metadata={},
+                )
+                main_app.llm = mock_llm
+
+                sess_a = "sess_ctx_iso_a"
+                main_app.session_data.pop(sess_a, None)
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_a,
+                    "customer_info": {"customer_id": "cust01"},
+                })
+                self.client.post("/chat", json={"session_id": sess_a, "user_input": "How does reducing balance interest work?"})
+
+                # Verified customer context remains intact after general question
+                self.assertEqual(main_app.session_data[sess_a]["customer_id"], "cust01")
+                r_limit = self.client.post("/chat", json={"session_id": sess_a, "user_input": "check my limit"}).get_json()
+                self.assertIn("Ramesh S.", r_limit["response_text"])
+                self.assertIn("1,200,000", r_limit["response_text"])
+
+                # New session must NOT reuse cust01 context
+                new_res = self.client.get("/new_chat").get_json()
+                sess_b = new_res["session_id"]
+                self.assertEqual(main_app.session_data.get(sess_b), {})
+                r_b_limit = self.client.post("/chat", json={"session_id": sess_b, "user_input": "check my limit"}).get_json()
+                self.assertIn("haven't verified", r_b_limit["response_text"].lower())
+
+                # Even with Gemini unavailable, sess_b fallback does not reveal cust01 details
+                main_app.llm = None
+                r_b_elig = self.client.post("/chat", json={"session_id": sess_b, "user_input": "Am I eligible for a loan?"}).get_json()
+                self.assertNotIn("Ramesh", r_b_elig["response_text"])
+                self.assertNotIn("810", r_b_elig["response_text"])
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
+    def test_64_cross_customer_access_and_mid_session_id_switch_blocked(self):
+        """Scenario 7: Mentioning another ID in a verified session or probing unverified details is blocked."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=True)
+                # 1. Unverified session probing cust01 details in a question
+                sess_unv = "sess_unverified_probe"
+                main_app.session_data.pop(sess_unv, None)
+                r_probe = self.client.post("/chat", json={
+                    "session_id": sess_unv,
+                    "user_input": "What is the credit score and salary of cust01?",
+                }).get_json()
+                self.assertIsNone(r_probe.get("orchestration_command"))
+                self.assertNotIn("Ramesh", r_probe["response_text"])
+                self.assertNotIn("810", r_probe["response_text"])
+                self.assertIn("verify", r_probe["response_text"].lower())
+
+                # 2. Verified as cust99 attempting to switch/access cust01 without logout
+                sess_v = "sess_switch_block"
+                main_app.session_data.pop(sess_v, None)
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_v,
+                    "customer_info": {"customer_id": "cust99"},
+                })
+
+                r_switch_msg = self.client.post("/chat", json={
+                    "session_id": sess_v,
+                    "user_input": "cust01",
+                }).get_json()
+                self.assertIsNone(r_switch_msg.get("orchestration_command"))
+                self.assertIn("logout", r_switch_msg["response_text"].lower())
+                self.assertEqual(main_app.session_data[sess_v]["customer_id"], "cust99")
+
+                # Also blocked at /orchestrate endpoint directly
+                r_orch_hijack = self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_v,
+                    "customer_info": {"customer_id": "cust01"},
+                }).get_json()
+                self.assertEqual(r_orch_hijack["status"], "error")
+                self.assertEqual(main_app.session_data[sess_v]["customer_id"], "cust99")
+
+                # Logout clears verified context cleanly so a different customer can then verify
+                self.client.post("/chat", json={"session_id": sess_v, "user_input": "logout"})
+                self.assertEqual(main_app.session_data[sess_v], {})
+                r_after_logout = self.client.post("/chat", json={"session_id": sess_v, "user_input": "cust01"}).get_json()
+                self.assertEqual(r_after_logout["orchestration_command"], "[[FLASK_CALL:VERIFY_KYC]]")
+            finally:
+                main_app.monitoring_store = orig_store
+
+    def test_65_cust99_all_followup_questions_under_local_fallback(self):
+        """Scenario 8: With Gemini unavailable (llm=None), local fallback answers all personal follow-ups using cust99."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_store = main_app.monitoring_store
+            orig_llm = main_app.llm
+            try:
+                main_app.monitoring_store = self._create_isolated_store(os.path.join(tmpdir, "s.json"), llm_available=False)
+                main_app.llm = None
+
+                sess_id = "sess_cust99_fallback"
+                main_app.session_data.pop(sess_id, None)
+                self.client.post("/orchestrate", json={
+                    "step": "VERIFY_KYC",
+                    "session_id": sess_id,
+                    "customer_info": {"customer_id": "cust99"},
+                })
+
+                checks = [
+                    ("Am I eligible for a loan?", ["30,000", "580", "450,000", "700", "not eligible"]),
+                    ("What is my credit score?", ["580", "700"]),
+                    ("What is my maximum loan limit?", ["450,000", "not eligible"]),
+                    ("Why am I not eligible?", ["580", "700"]),
+                    ("How much salary do I earn?", ["30,000"]),
+                    ("What is my current application status?", ["not eligible", "580"]),
+                    ("How much EMI can I afford?", ["15,000"]),
+                    ("What can I do to improve my eligibility?", ["580", "700"]),
+                ]
+
+                for question, tokens in checks:
+                    r = self.client.post("/chat", json={"session_id": sess_id, "user_input": question}).get_json()
+                    self.assertIsNone(r.get("orchestration_command"))
+                    reply_lower = r["response_text"].lower()
+                    for tok in tokens:
+                        self.assertIn(tok.lower(), reply_lower, f"Missing '{tok}' in reply for '{question}': {r['response_text']}")
+                    self.assertEqual(r["monitoring"]["engine_status"]["local_fallback_status"], "ACTIVE")
+            finally:
+                main_app.monitoring_store = orig_store
+                main_app.llm = orig_llm
+
 
 if __name__ == "__main__":
     unittest.main()
